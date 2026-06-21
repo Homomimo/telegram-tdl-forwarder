@@ -144,8 +144,8 @@ docker-compose --version
 ### 步骤 1：克隆仓库
 
 ```bash
-git clone https://github.com/Homomimo/tdl2tg-bot.git
-cd tdl2tg-bot
+git clone https://github.com/Homomimo/telegram-tdl-forwarder.git
+cd telegram-tdl-forwarder
 ```
 
 ---
@@ -164,7 +164,7 @@ nano docker-compose.yml
 services:
   telegram-bot:
     build: .
-    container_name: tdl2tg-bot
+    container_name: telegram-tdl-forwarder
     restart: "no"
     volumes:
       - ./forward_history.json:/app/forward_history.json
