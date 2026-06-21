@@ -9,11 +9,11 @@ services:
       - ~/.tdl:/root/.tdl
     environment:
       - TZ=Asia/Shanghai  # 强制指定时区变量
-      - API_ID=16612890
-      - API_HASH=c0fc7dab1acc44f2a2da55cba248d656
-      - BOT_TOKEN=7965940462:AAFCSi5PlG5xl9cqQDk6AFuZP4AT-K9OZQM
-      - ADMIN_IDS=1227176277
-      - FORWARD_TO_CHAT_ID=1234567890
+      - API_ID=
+      - API_HASH=
+      - BOT_TOKEN=
+      - ADMIN_IDS=
+      - FORWARD_TO_CHAT_ID=
       - MONITOR_CHAT_IDS=源频道ID
       - USER_MONITOR_ENABLED=1
       - USER_SESSION_STRING=填入gen-session输出的字符串
@@ -27,8 +27,8 @@ services:
       - ./gen_telethon_session.py:/app/gen_telethon_session.py
     environment:
       - TZ=Asia/Shanghai
-      - API_ID=16612890
-      - API_HASH=c0fc7dab1acc44f2a2da55cba248d656
+      - API_ID=
+      - API_HASH=
     command: python3 -u gen_telethon_session.py
     stdin_open: true
     tty: true
