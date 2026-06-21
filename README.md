@@ -1,4 +1,4 @@
-# Telegram 转发机器人（Docker + TDL）
+﻿# Telegram 转发机器人（Docker + TDL）
 
 一个基于 Telegram Bot 的文件转发工具，可将消息或文件转发到指定私人频道，并通过 [TDL](https://github.com/iyear/tdl) 提升大文件下载与传输效率。
 
@@ -206,6 +206,10 @@ services:
       - MONITOR_CHAT_IDS=源频道裸ID
       - USER_MONITOR_ENABLED=1
       - USER_SESSION_STRING=填入gen-session输出的字符串
+      - AUTO_DELETE_BOT_MESSAGES=1
+      - AUTO_DELETE_STATUS_SECONDS=300
+      - AUTO_DELETE_COMMAND_SECONDS=120
+      - AUTO_DELETE_ERROR_SECONDS=600
 
   gen-session:
     build: .
@@ -302,6 +306,26 @@ docker-compose logs -f
 2. 在 Telegram 中向机器人发送消息链接、转发频道消息，或直接发送支持的文件消息。
 3. 机器人会将任务加入队列。
 4. 处理完成后，消息会被转发到配置的目标频道。
+
+### 自动删除机器人消息
+
+默认会自动删除 bot 发送的临时消息，可通过环境变量调整：
+
+```yaml
+- AUTO_DELETE_BOT_MESSAGES=1
+- AUTO_DELETE_STATUS_SECONDS=300
+- AUTO_DELETE_COMMAND_SECONDS=120
+- AUTO_DELETE_ERROR_SECONDS=600
+```
+
+说明：
+
+- 状态消息只会在任务成功、失败或被 `/tdlstop` 停止后开始倒计时删除。
+- 正在显示进度的状态消息不会提前删除。
+- 普通命令回复默认 120 秒后删除。
+- 失败或错误状态默认 600 秒后删除。
+- `/start` 和 `/help` 的帮助内容不会自动删除。
+- 设置 `AUTO_DELETE_BOT_MESSAGES=0` 可关闭自动删除。
 
 ### 自动监听源频道
 

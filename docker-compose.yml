@@ -1,4 +1,4 @@
-services:
+﻿services:
   telegram-bot:
     build: .
     container_name: telegram-tdl-forwarder
@@ -14,9 +14,13 @@ services:
       - BOT_TOKEN=
       - ADMIN_IDS=
       - FORWARD_TO_CHAT_ID=
-      - MONITOR_CHAT_IDS=源频道ID
+      - MONITOR_CHAT_IDS=源频道裸ID
       - USER_MONITOR_ENABLED=1
       - USER_SESSION_STRING=填入gen-session输出的字符串
+      - AUTO_DELETE_BOT_MESSAGES=1
+      - AUTO_DELETE_STATUS_SECONDS=300
+      - AUTO_DELETE_COMMAND_SECONDS=120
+      - AUTO_DELETE_ERROR_SECONDS=600
 
   gen-session:
     build: .
@@ -32,3 +36,4 @@ services:
     command: python3 -u gen_telethon_session.py
     stdin_open: true
     tty: true
+

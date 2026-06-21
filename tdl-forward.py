@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import json
 import logging
@@ -38,6 +38,10 @@ FORWARD_LOG_FILE = "forward_history.json"
 FORWARD_LOG_MAX_DAYS = 7  # 保留最近7天
 TELEGRAM_LINK_PATTERN = re.compile(r"https://t\.me/(?:c/)?[A-Za-z0-9_]+/\d+")
 EXCLUDE_KEYWORDS = ["addlist"]
+AUTO_DELETE_BOT_MESSAGES = os.getenv("AUTO_DELETE_BOT_MESSAGES", "1").lower() not in ("0", "false", "no", "off")
+AUTO_DELETE_STATUS_SECONDS = int(os.getenv("AUTO_DELETE_STATUS_SECONDS", "300"))
+AUTO_DELETE_COMMAND_SECONDS = int(os.getenv("AUTO_DELETE_COMMAND_SECONDS", "120"))
+AUTO_DELETE_ERROR_SECONDS = int(os.getenv("AUTO_DELETE_ERROR_SECONDS", "600"))
 
 
 class TaskStatus(Enum):
@@ -87,6 +91,17 @@ class TaskQueue:
                 pass
         logger.info("任务队列已停止")
 
+    async def _edit_task_status(self, task: ForwardTask, text: str):
+        try:
+            status_client = task.status_client or task.event.client
+            status_msg = await status_client.get_messages(task.chat_id, ids=task.status_msg_id)
+            if status_msg:
+                await status_msg.edit(text)
+            return status_msg
+        except Exception as e:
+            logger.debug(f"更新任务状态失败: {e}")
+        return None
+
     async def clear_pending_tasks(self) -> int:
         cleared = 0
         while True:
@@ -98,16 +113,23 @@ class TaskQueue:
             task.error_msg = "管理员已停止并清空等待队列"
             if task.grouped_id:
                 self.bot._album_handling.discard(task.grouped_id)
-            try:
-                status_client = task.status_client or task.event.client
-                status_msg = await status_client.get_messages(task.chat_id, ids=task.status_msg_id)
-                if status_msg:
-                    await status_msg.edit("⏹️ 已被管理员停止，等待队列已清空")
-            except Exception as e:
-                logger.debug(f"更新被清空任务状态失败: {e}")
+            status_msg = await self._edit_task_status(task, "⏹️ 已被管理员停止，等待队列已清空")
+            self.bot.schedule_status_delete(status_msg, failed=True)
             self.queue.task_done()
             cleared += 1
         return cleared
+
+    async def mark_current_task_stopped(self) -> bool:
+        task = self.current_task
+        if not task:
+            return False
+        task.status = TaskStatus.FAILED
+        task.error_msg = "管理员已停止 TDL 进程"
+        if task.grouped_id:
+            self.bot._album_handling.discard(task.grouped_id)
+        status_msg = await self._edit_task_status(task, "⏹️ 已被管理员停止，当前 TDL 进程已终止")
+        self.bot.schedule_status_delete(status_msg, failed=True)
+        return True
 
     async def add_task(self, event, link: str, status_msg_id: int, chat_id: int, grouped_id: Optional[int] = None,
                        mode: str = "clone", message_ids: Optional[list[int]] = None, source_chat_id: Optional[int] = None,
@@ -322,6 +344,13 @@ class TaskQueue:
             except Exception:
                 pass
         finally:
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                try:
+                    status_client = task.status_client or task.event.client
+                    status_msg = await status_client.get_messages(task.chat_id, ids=task.status_msg_id)
+                    self.bot.schedule_status_delete(status_msg, failed=task.status == TaskStatus.FAILED)
+                except Exception as e:
+                    logger.debug(f"安排状态消息自动删除失败: {e}")
             if task.grouped_id:
                 self.bot._album_handling.discard(task.grouped_id)
 
@@ -383,7 +412,7 @@ START_MESSAGE_ADMIN = (
     '  显示本帮助\n\n'
     '【注意事项】\n'
     '- 目标频道必须先用 /forwardto 设置，或通过 FORWARD_TO_CHAT_ID 环境变量配置\n'
-    '- 自动监听源频道通过 MONITOR_CHAT_IDS 环境变量配置，多个频道用英文逗号分隔\n'
+    '- 自动监听源频道通过 MONITOR_CHAT_IDS 环境变量配置，只填写裸 ID，不要加 -100 前缀，多个频道用英文逗号分隔\n'
     '- 用户账号监听通过 USER_SESSION_STRING 或 USER_SESSION_FILE 启用；该用户账号需要加入源频道\n'
     '- /monitor 子命令只修改当前运行中的内存配置；容器重启后仍以环境变量为准\n'
     '- 机器人和 tdl 登录账号需要有源频道读取权限、目标频道发帖权限\n'
@@ -487,13 +516,23 @@ def parse_export_range_args(parts: list[str]) -> tuple[Optional[int], Optional[i
     return chat_id, start_id, end_id, None
 
 
+def parse_monitor_chat_id(text: str) -> Optional[int]:
+    chat_id = parse_chat_id(text)
+    if chat_id is None or chat_id <= 0:
+        return None
+    raw = str(chat_id)
+    if raw.startswith('100') and len(raw) > 10:
+        return None
+    return chat_id
+
+
 def parse_chat_ids(raw: str) -> list[int]:
     result = []
     for item in raw.split(','):
-        chat_id = parse_chat_id(item)
+        chat_id = parse_monitor_chat_id(item)
         if chat_id is None:
             if item.strip():
-                logger.warning(f"忽略无效频道ID: {item}")
+                logger.warning(f"忽略无效监听源频道裸ID: {item}")
             continue
         result.append(chat_id)
     return result
@@ -923,9 +962,9 @@ class TelegramBot:
             return (
                 "ℹ️ 尚未配置自动监听源频道\n\n"
                 "用法：\n"
-                "/monitor add <频道ID>\n"
-                "/monitor del <频道ID>\n"
-                "/monitor set <频道ID1,频道ID2>\n"
+                "/monitor add <源频道裸ID>\n"
+                "/monitor del <源频道裸ID>\n"
+                "/monitor set <源频道裸ID1,源频道裸ID2>\n"
                 "/monitor clear"
             )
         lines = ["📡 当前自动监听源频道：\n"]
@@ -945,6 +984,27 @@ class TelegramBot:
                 await self.client.send_message(admin_id, text)
             except Exception as e:
                 logger.error(f"向管理员 {admin_id} 发送通知失败: {e}")
+
+    async def _delete_message_later(self, message, delay: int) -> None:
+        if not message or delay <= 0:
+            return
+        await asyncio.sleep(delay)
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.debug(f"自动删除消息失败: {e}")
+
+    def schedule_delete(self, message, delay: int) -> None:
+        if not AUTO_DELETE_BOT_MESSAGES or not message or delay <= 0:
+            return
+        asyncio.create_task(self._delete_message_later(message, delay))
+
+    def schedule_status_delete(self, message, failed: bool = False) -> None:
+        delay = AUTO_DELETE_ERROR_SECONDS if failed else AUTO_DELETE_STATUS_SECONDS
+        self.schedule_delete(message, delay)
+
+    def schedule_command_delete(self, message) -> None:
+        self.schedule_delete(message, AUTO_DELETE_COMMAND_SECONDS)
 
     async def create_auto_status_message(self, event, text: str):
         if ADMIN_IDS:
@@ -1021,6 +1081,7 @@ class TelegramBot:
         status_chat_id = getattr(status_msg, 'chat_id', event.chat_id)
         if self.target_chat_id is None:
             await status_msg.edit("❌ 未配置目标频道ID，请管理员使用 /forwardto 设置")
+            self.schedule_status_delete(status_msg, failed=True)
             return
 
         if self.is_album(event):
@@ -1037,10 +1098,12 @@ class TelegramBot:
 
         if not link:
             await status_msg.edit("❌ 无法识别消息链接，请转发消息或发送 https://t.me/... 链接")
+            self.schedule_status_delete(status_msg, failed=True)
             return
 
         if any(kw in link.lower() for kw in EXCLUDE_KEYWORDS):
             await status_msg.edit(f"❌ 链接包含排除关键词，已跳过: {link}")
+            self.schedule_status_delete(status_msg, failed=True)
             return
 
         if self.is_album(event):
@@ -1074,6 +1137,17 @@ class TelegramBot:
         if command == '/help':
             await event.respond(START_MESSAGE_ADMIN)
             return True
+
+        original_respond = event.respond
+
+        async def auto_delete_respond(*args, **kwargs):
+            auto_delete = kwargs.pop("_auto_delete", True)
+            message = await original_respond(*args, **kwargs)
+            if auto_delete:
+                self.schedule_command_delete(message)
+            return message
+
+        event.respond = auto_delete_respond
 
         if command == '/restart':
             await event.respond("🔄 正在重启机器人...")
@@ -1129,7 +1203,7 @@ class TelegramBot:
                 lines.append("无法获取 chat_id\n")
             lines.append("\n可用以下命令添加监听：\n")
             if event_chat_ids:
-                lines.append(f"/monitor add {event_chat_ids[0]}")
+                lines.append(f"/monitor add {self.normalize_source_chat_id(event_chat_ids[0])}")
             else:
                 lines.append("/monitor add <频道ID>")
             await event.respond("".join(lines))
@@ -1138,12 +1212,11 @@ class TelegramBot:
         if command == '/tdlstop':
             stopped = await self.tdl.stop_active_processes()
             cleared = await self.task_queue.clear_pending_tasks()
-            if self.task_queue.current_task:
-                self.task_queue.current_task.status = TaskStatus.FAILED
-                self.task_queue.current_task.error_msg = "管理员已停止 TDL 进程"
+            current_stopped = await self.task_queue.mark_current_task_stopped()
             await event.respond(
                 f"⏹️ 已执行全局停止\n"
                 f"停止中的 TDL 进程数：{stopped}\n"
+                f"当前任务标记停止：{'是' if current_stopped else '否'}\n"
                 f"清空等待任务数：{cleared}"
             )
             return True
@@ -1164,13 +1237,13 @@ class TelegramBot:
                     await event.respond(
                         "❌ 缺少频道 ID\n\n"
                         "用法：\n"
-                        "/monitor add <频道ID>\n"
-                        "/monitor del <频道ID>"
+                        "/monitor add <源频道裸ID>\n"
+                        "/monitor del <源频道裸ID>"
                     )
                     return True
-                chat_id = parse_chat_id(parts[2])
+                chat_id = parse_monitor_chat_id(parts[2])
                 if chat_id is None:
-                    await event.respond("❌ 频道 ID 格式无效，请输入数字，例如：/monitor add -1001234567890")
+                    await event.respond("❌ 监听源频道 ID 格式无效，请输入裸 ID，不要加 -100 前缀，例如：/monitor add 1234567890")
                     return True
 
                 if action == 'add':
@@ -1192,8 +1265,8 @@ class TelegramBot:
                 if len(parts) < 3:
                     await event.respond(
                         "❌ 缺少频道 ID 列表\n\n"
-                        "用法：/monitor set <频道ID1,频道ID2>\n"
-                        "示例：/monitor set -1001234567890,-1009876543210"
+                        "用法：/monitor set <源频道裸ID1,源频道裸ID2>\n"
+                        "示例：/monitor set 1234567890,9876543210"
                     )
                     return True
                 new_ids = parse_chat_ids(" ".join(parts[2:]).replace('，', ','))
@@ -1213,9 +1286,9 @@ class TelegramBot:
                 "❌ 未知 /monitor 子命令\n\n"
                 "可用命令：\n"
                 "/monitor\n"
-                "/monitor add <频道ID>\n"
-                "/monitor del <频道ID>\n"
-                "/monitor set <频道ID1,频道ID2>\n"
+                "/monitor add <源频道裸ID>\n"
+                "/monitor del <源频道裸ID>\n"
+                "/monitor set <源频道裸ID1,源频道裸ID2>\n"
                 "/monitor clear"
             )
             return True
@@ -1334,7 +1407,7 @@ class TelegramBot:
             # 用于显示的链接占位
             display_link = f"chat_id:{chat_id}"
 
-            status_msg = await event.respond("⏳ 正在加入范围导出队列...")
+            status_msg = await event.respond("⏳ 正在加入范围导出队列...", _auto_delete=False)
             gid = None
             position = await self.task_queue.add_task(
                 event, display_link, status_msg.id, event.chat_id, gid,
@@ -1424,7 +1497,8 @@ class TelegramBot:
                         lines.append(f"/monitor add {event_chat_ids[0]}")
                     else:
                         lines.append("/monitor add <频道ID>")
-                    await event.respond("".join(lines))
+                    msg = await event.respond("".join(lines))
+                    self.schedule_command_delete(msg)
                     return
 
                 if text.startswith('/'):
