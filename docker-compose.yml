@@ -1,7 +1,7 @@
 services:
   telegram-bot:
     build: .
-    container_name: tdl2tg-bot
+    container_name: telegram-tdl-forwarder
     restart: "no"
     volumes:
       - ./forward_history.json:/app/forward_history.json
