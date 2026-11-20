@@ -13,7 +13,7 @@ from bot_fixture import MonitorHarness, SOURCE, TARGET, app
 class ReviewFixTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
     async def test_range_passes_all_messages_to_forward(self):
         forwarded = []
-        async def tdl(cmd, progress):
+        async def tdl(cmd, progress, **kwargs):
             if cmd[1:3] == ['chat', 'export']:
                 self.assertEqual(cmd[cmd.index('-i') + 1], '11,12')
                 rows = [{'id': 11, 'type': 'text'}, {'id': 12, 'type': 'photo'}]

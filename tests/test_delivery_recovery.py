@@ -39,6 +39,7 @@ class RecoveryTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
         for mid in (8, 3, 8):
             ev = self.event(mid, album=55)
             await self.bot.enqueue_monitor_post(ev, ev.messages, album_member=True)
+        await self.enqueue(self.event(3, 8, album=55))
         for _ in range(3):
             await self.enqueue(self.event(8), edited=True)
         q = await self.reopen()
@@ -157,11 +158,11 @@ class RecoveryTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bot.task_queue.queue.empty())
 
     async def test_streamed_item_errors_survive_progress_tail_in_both_paths(self):
-        async def run(cmd, report):
+        async def run(cmd, progress, *, on_record):
             for mid in (4, 19):
-                await report(f'\x1b[31mSource(12):{mid} -> Target(33) error: upload failed\x1b[0m')
+                on_record(f'\x1b[31mSource(12):{mid} -> Target(33) error: upload failed\x1b[0m')
             for _ in range(40):
-                await report('progress')
+                on_record('progress')
             return 0, 'finished', ''
         with patch.object(self.bot.tdl, '_run_command', side_effect=run):
             for method, arg in ((self.bot.tdl.forward_clone, 'link'), (self.bot.tdl.forward_from_export, 'file')):

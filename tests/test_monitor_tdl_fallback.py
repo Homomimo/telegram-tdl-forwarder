@@ -85,9 +85,12 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         self.assertEqual([int(c.args[0].rsplit('/', 1)[1]) for c in self.bot.tdl.download_media.await_args_list], [3,7,12])
         self.bot.tdl.forward_clone.assert_not_awaited()
 
-    async def test_missing_album_event_members_read_from_source(self):
+    async def test_fallback_waits_when_source_has_more_than_album_event(self):
         self.restrict(photo(3, 99), photo(7, 99), photo(12, 99))
-        await self.enqueue(self.event(7, album=99))
+        await self.enqueue(self.event(3, 7, album=99))
+        self.assertEqual((await self.process()).status, app.TaskStatus.PENDING)
+        self.bot.client.forward.assert_not_awaited()
+        await self.enqueue(self.event(3, 7, 12, album=99))
         self.assertEqual((await self.process()).status, app.TaskStatus.COMPLETED)
         self.assertEqual(len(self.publications()[0].multi_media), 3)
 
@@ -95,10 +98,12 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         self.restrict(photo(3, 99), photo(7, 99))
         self.bot.monitor_message_map().remember(SOURCE, TARGET, {3: 93})
         await self.enqueue(self.event(3, 7, album=99))
-        with self.assertLogs(app.logger, 'ERROR'):
-            self.assertEqual((await self.process()).status, app.TaskStatus.FAILED)
+        with self.assertLogs(app.logger, 'WARNING'):
+            self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)
+        self.bot.client.forward.assert_not_awaited()
         self.assertFalse(self.publications())
         self.assertEqual(self.state(7), app.TaskStatus.PENDING)
+        self.assertEqual(self.bot.task_queue.journal.reviews()[1][0]['message_ids'], [7])
 
     async def test_caption_edit_does_not_reattach_protected_media(self):
         self.restrict(photo(5))
@@ -294,9 +299,9 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
             self.posts[12] = photo(12, 99)
         self.bot.tdl.download_media.side_effect = download
         await self.enqueue(self.event(3, 7, album=99))
-        with self.assertLogs(app.logger, 'ERROR'):
-            self.assertEqual((await self.process()).status, app.TaskStatus.FAILED)
+        self.assertEqual((await self.process()).status, app.TaskStatus.PENDING)
         self.assertFalse(self.publications())
+        self.assertEqual(self.state(3), app.TaskStatus.PENDING)
 
     async def test_resync_command_uses_clone_mapping_and_returns_target_link(self):
         self.restrict(photo(5))
@@ -343,8 +348,8 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         self.bot.client.edit_message.assert_not_awaited()
 
     async def test_album_boundary_and_unknown_member_block_publication(self):
-        self.restrict(photo(150, 99), photo(250, 99))
-        await self.enqueue(self.event(150, album=99))
+        self.restrict(photo(150, 99), photo(160, 99), photo(260, 99))
+        await self.enqueue(self.event(150, 160, album=99))
         with self.assertLogs(app.logger, 'ERROR'):
             self.assertEqual((await self.process()).status, app.TaskStatus.FAILED)
         self.assertFalse(self.publications())
@@ -439,8 +444,8 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
                 f'https://t.me/c/{SOURCE}/5', '--dir', directory, '--template', '5.bin', '--restart'])
 
     async def test_manual_clone_zero_exit_with_message_error_still_fails(self):
-        async def run(cmd, progress):
-            await progress(f'Source({SOURCE}):5 -> Target({TARGET}) error: upload failed')
+        async def run(cmd, progress, *, on_record):
+            on_record(f'Source({SOURCE}):5 -> Target({TARGET}) error: upload failed')
             return 0, '', ''
         with patch.object(self.bot.tdl, '_run_command', side_effect=run):
             ok, output = await self.bot.tdl.forward_clone(f'https://t.me/c/{SOURCE}/5', TARGET)
