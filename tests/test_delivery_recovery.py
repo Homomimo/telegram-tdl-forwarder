@@ -14,6 +14,128 @@ from bot_fixture import MonitorHarness, SOURCE, TARGET, app, source
 
 
 class RecoveryTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
+    async def test_hidden_forward_origin_does_not_submit_a_caption_link(self):
+        ev = self.event(5)
+        ev.respond = AsyncMock(return_value=None)
+        ev.message.forward = NS(from_id=app.types.PeerUser(22), channel_post=None)
+        await self.bot.do_forward(ev)
+        self.assertTrue(self.bot.task_queue.queue.empty())
+        self.assertIn('无法确认原帖', ev.respond.await_args.args[0])
+        ev.message.forward = None
+        await self.bot.do_forward(ev)
+        self.assertEqual(self.bot.task_queue.journal.restore()[0][2]['link'], ev.message.text)
+
+    async def test_stop_invalidates_manual_admissions_waiting_for_status(self):
+        q = self.bot.task_queue
+        for mode in ('clone', 'export_range'):
+            with self.subTest(mode=mode):
+                entered, resume = asyncio.Event(), asyncio.Event()
+                ev = self.event(1)
+                ev.sender_id = 61
+                msg = NS(id=88, chat_id=ev.chat_id, edit=AsyncMock(), client=self.bot.client)
+
+                async def respond(text):
+                    entered.set()
+                    await resume.wait()
+                    return msg
+
+                ev.respond = respond
+                feedback = AsyncMock()
+                with patch.object(app, 'ADMIN_IDS', [61]):
+                    admission = asyncio.create_task(self.bot.do_forward(ev) if mode == 'clone' else
+                        self.bot.run_admin_action(ev, ['/export_range', str(SOURCE), '1', '3'], feedback,
+                                                  panel_feedback=True))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 2)
+                        await q.stop_tdl_tasks()
+                    finally:
+                        resume.set()
+                        await admission
+                self.assertEqual(q.journal.restore(), [])
+                self.assertIn('未入队', msg.edit.await_args.args[0])
+                if mode == 'export_range':
+                    self.assertIn('未入队', feedback.await_args.args[0])
+
+    async def test_stop_invalidates_resync_waiting_for_map_lock(self):
+        q = self.bot.task_queue
+        self.bot.monitor_message_map().remember(SOURCE, TARGET, {7: 99})
+        ev, feedback = self.event(7), AsyncMock()
+        ev.sender_id = 61
+        with patch.object(app, 'ADMIN_IDS', [61]):
+            async with self.bot._monitor_db_lock:
+                admission = asyncio.create_task(self.bot.run_admin_action(ev, ['/resync', str(SOURCE), '7'], feedback))
+                await asyncio.sleep(0)  # resync now waits for the same lock
+                await q.stop_tdl_tasks()
+            await admission
+        self.assertEqual(q.journal.restore(), [])
+        self.assertIn('未加入同步队列', feedback.await_args.args[0])
+
+    async def test_missing_tdl_binary_is_a_failure_not_an_uncertain_delivery(self):
+        q = self.bot.task_queue
+        self.bot.tdl.tdl_path = str(Path(app.MONITOR_MAP_FILE).parent / 'no-such-tdl')
+        await q.add_task(self.event(9), 'manual', None, 1, target_chat_id=TARGET)
+        task = await self.process()
+        self.assertEqual(task.status, app.TaskStatus.FAILED)
+        self.assertEqual(q.journal.restore(), [])
+        self.assertIn('未启动', task.error_msg)
+        # An I/O failure after spawn is not proof that nothing was sent.
+        with patch.object(self.bot.tdl, '_run_command', side_effect=FileNotFoundError('lost after spawn')):
+            ok, detail = await self.bot.tdl.forward_clone('manual', TARGET)
+        self.assertFalse(ok)
+        self.assertIsInstance(detail, app.UnconfirmedReceipt)
+
+    async def test_cancelled_sending_task_status_agrees_with_review_journal(self):
+        q, entered = self.bot.task_queue, asyncio.Event()
+        status = NS(edit=AsyncMock())
+        self.bot.client.get_messages.return_value = status
+
+        async def sending(*args):
+            entered.set()
+            await asyncio.Future()
+
+        self.bot.tdl.forward_clone = sending
+        await q.add_task(self.event(8), 'manual', 123, 1, target_chat_id=TARGET)
+        await q.start()
+        await asyncio.wait_for(entered.wait(), 2)
+        task = q.current_task
+        self.assertEqual(await q.stop_tdl_tasks(), (True, 0))
+        self.assertEqual(q.journal.reviews()[0], 1)
+        self.assertEqual(task.status, app.TaskStatus.UNCONFIRMED)
+        self.assertIn('待核对', status.edit.await_args.args[0])
+
+    async def test_unmapped_edit_is_counted_before_and_after_restart_and_on_clear(self):
+        await self.enqueue(self.event(9), edited=True)
+        await self.process()
+        self.assertEqual(self.bot.task_queue.get_queue_status()['queue_size'], 1)
+        q = await self.reopen()
+        self.assertEqual(q.get_queue_status()['queue_size'], 1)
+        self.assertEqual(await q.stop_tdl_tasks(), (False, 1))
+        self.assertEqual(q.journal.restore(), [])
+        self.assertEqual(q.get_queue_status()['queue_size'], 0)
+
+    async def test_edit_queued_during_running_edit_is_counted_but_current_is_not_cancelled(self):
+        q = self.bot.task_queue
+        self.bot.monitor_message_map().remember(SOURCE, TARGET, {11: 99})
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def editing(*args, **kwargs):
+            entered.set()
+            await release.wait()
+
+        self.bot.client.edit_message.side_effect = editing
+        await self.enqueue(self.event(11), edited=True)
+        await q.start()
+        await asyncio.wait_for(entered.wait(), 2)
+        try:
+            await self.enqueue(self.event(11), edited=True)
+            self.assertEqual(q.get_queue_status()['queue_size'], 1)
+            self.assertEqual(await q.stop_tdl_tasks(), (False, 1))
+        finally:
+            release.set()
+            await asyncio.wait_for(q.queue.join(), 2)
+        self.bot.client.edit_message.assert_awaited_once()
+        self.assertEqual(q.journal.restore(), [])
+
     async def reopen(self):
         await self.bot.stop()
         self.bot = self.make_bot()

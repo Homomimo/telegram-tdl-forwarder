@@ -139,6 +139,10 @@ class CopyOutcomeUnknown(Exception):
     """已保留发送意图，不能证明 Telegram 未发送。"""
 
 
+class TDLNotStarted(Exception):
+    """The OS rejected the executable before it could attempt delivery."""
+
+
 class UnconfirmedReceipt(str):
     """TDL diagnostics without proof of complete delivery (still JSON-compatible)."""
 
@@ -393,18 +397,24 @@ class TaskQueue:
                 self._edits.pop(task.edit_key, None)
         return pending
 
+    def _held_edit_count(self) -> int:
+        # Neither early edits nor a running edit's follow-up have a slot in the FIFO.
+        return len(self._early_edits) + int(bool(self.current_task and self.current_task.followup))
+
     async def clear_pending_tasks(self, *, notify: bool = True) -> int:
-        return await self._finish_pending(self._cancel_pending(), notify)
+        pending, held = self._cancel_pending()
+        return held + await self._finish_pending(pending, notify)
 
     def _cancel_pending(self, stop_current=False):
         self.journal.cancel_waiters(self.current_task.job_id if self.current_task else None,
                                     [t.job_id for t in self._retry_timers.values()], stop_current)
         self.admission_epoch += 1
+        held = self._held_edit_count()
         pending = self._take_pending()
         if self.current_task and self.current_task.followup:
             self.current_task.followup = None
             self.current_task.edit_dirty = False
-        return pending
+        return pending, held
 
     async def _finish_pending(self, pending, notify: bool) -> int:
         for task in pending:
@@ -433,7 +443,7 @@ class TaskQueue:
             self._restore()
             worker, current = self.worker_task, self.current_task
             manual = current is not None and current.mode in ("clone", "export_range") and current.status == TaskStatus.PROCESSING
-            pending = self._cancel_pending(stop_current=manual)
+            pending, held = self._cancel_pending(stop_current=manual)
             self._resume.clear()
             cancel_worker = worker is not None and not worker.done() and (current is None or manual)
             try:
@@ -441,12 +451,17 @@ class TaskQueue:
                     worker.cancel()
                     await asyncio.gather(worker, return_exceptions=True)  # Includes child-process cleanup.
                 if manual:
-                    current.status, current.error_msg = TaskStatus.FAILED, "管理员已停止 TDL 任务"
+                    if current.send_started:
+                        current.status = TaskStatus.UNCONFIRMED
+                        current.error_msg = "管理员已停止 TDL；投递结果待核对，请先检查目标频道，不要直接重发"
+                    else:
+                        current.status = TaskStatus.FAILED
+                        current.error_msg = "管理员已停止 TDL 任务，尚未发送"
                     msg = await self._get_status(current)
-                    await edit_status(msg, "⏹️ 当前 TDL 任务已被管理员停止")
+                    await edit_status(msg, "⏹️ " + current.error_msg)
                     self.bot.schedule_status_delete(msg, failed=True)
                 cleared = await self._finish_pending(pending, True)
-                return manual, cleared
+                return manual, cleared + held
             finally:
                 self._resume.set()
                 if cancel_worker and self.running:
@@ -463,10 +478,10 @@ class TaskQueue:
         if len(self._early_edits) > MONITOR_EARLY_EDIT_LIMIT:
             self.journal.discard([self._early_edits.pop(next(iter(self._early_edits)))])
 
-    async def enqueue_edit(self, event, source_id: int, mid: int, target_id: int) -> Optional[int]:
+    async def enqueue_edit(self, event, source_id: int, mid: int, target_id: int, *, admission_epoch=None) -> Optional[int]:
         return await self.add_task(event, f"https://t.me/c/{source_id}/{mid}", None, event.chat_id,
                                    mode="monitor_edit", message_ids=[mid], source_chat_id=source_id,
-                                   target_chat_id=target_id)
+                                   target_chat_id=target_id, admission_epoch=admission_epoch)
 
     async def reconcile_early_edits(self, task: ForwardTask, confirmed: dict[int, int]) -> None:
         for mid in confirmed:
@@ -512,8 +527,8 @@ class TaskQueue:
                        grouped_id: Optional[int] = None, mode: str = "clone",
                        message_ids: Optional[list[int]] = None, source_chat_id: Optional[int] = None,
                        status_client: Optional[TelegramClient] = None, *, target_chat_id: int,
-                       album_member: bool = False) -> Optional[int]:
-        if self.bot._stopping:
+                       album_member: bool = False, admission_epoch: Optional[int] = None) -> Optional[int]:
+        if self.bot._stopping or (admission_epoch is not None and admission_epoch != self.admission_epoch):
             return None  # The queue may already be drained and its worker gone.
         try:
             self._restore()
@@ -523,9 +538,12 @@ class TaskQueue:
             logger.exception('未能保存入队记录：%s → %s', link, target_chat_id)
             return None
 
-    def admission_error(self, result='任务未入队'):
-        return (f'⏹️ 服务正在停止，{result}' if self.bot._stopping else
-                f'⚠️ 无法保存队列记录，{result}。请检查数据卷空间和写入权限。')
+    def admission_error(self, result='任务未入队', *, admission_epoch=None):
+        if self.bot._stopping:
+            return f'⏹️ 服务正在停止，{result}'
+        if admission_epoch is not None and admission_epoch != self.admission_epoch:
+            return f'⏹️ 管理员已清空队列，{result}'
+        return f'⚠️ 无法保存队列记录，{result}。请检查数据卷空间和写入权限。'
 
     def _admit(self, event, link, status_msg_id, chat_id, grouped_id, mode, message_ids,
                source_chat_id, status_client, target_chat_id, album_member):
@@ -731,7 +749,8 @@ class TaskQueue:
 
     def get_queue_status(self) -> dict:
         return {
-            "queue_size": self.queue.qsize() + len(self._retry_timers) + len(self._albums) + len(self._peer_wait),
+            "queue_size": (self.queue.qsize() + len(self._retry_timers) + len(self._albums)
+                           + len(self._peer_wait) + self._held_edit_count()),
             "current_task": {
                 "link": self.current_task.link[:50] if self.current_task else None,
                 "status": self.current_task.status.value if self.current_task else None
@@ -1427,6 +1446,8 @@ class TDLDownloader:
         readers = []
         try:
             process = await asyncio.shield(spawn)
+        except (FileNotFoundError, PermissionError) as exc:
+            raise TDLNotStarted(f'TDL 未启动，请检查可执行文件及权限：{exc}') from exc
         except asyncio.CancelledError:
             try:
                 process = await spawn
@@ -1597,6 +1618,8 @@ class TDLDownloader:
             code, out, err = await self._run_command(cmd, progress_callback, on_record=inspect)
             for line in (out + '\n' + err).splitlines():
                 inspect(line)
+        except TDLNotStarted as exc:
+            return False, str(exc)
         except Exception as e:
             code, out, err = -1, '', str(e)
         if failed:
@@ -1662,9 +1685,11 @@ class TelegramBot:
         fwd = message.forward
         if fwd:
             peer, mid = getattr(fwd, 'from_id', None), getattr(fwd, 'channel_post', None)
-            if isinstance(peer, types.PeerChannel) and peer.channel_id > 0 and isinstance(mid, int) and mid > 0:
-                # PeerChannel already contains the bare source ID. Do not use the receiving chat's ID.
+            if (isinstance(peer, types.PeerChannel) and 0 < peer.channel_id <= MAX_CHANNEL_ID
+                    and type(mid) is int and 0 < mid < 2**31):
                 return f"https://t.me/c/{peer.channel_id}/{mid}"
+            # A forwarded caption is content, not evidence of that post's origin.
+            return None
         return self.extract_link(message.text or "")
 
     @staticmethod
@@ -1721,7 +1746,7 @@ class TelegramBot:
     async def notify_admins(self, text: str) -> None:
         for admin_id in ADMIN_IDS:
             try:
-                await self.client.send_message(admin_id, text)
+                await asyncio.wait_for(self.client.send_message(admin_id, text), STATUS_RPC_TIMEOUT)
             except Exception as e:
                 logger.error('向管理员发送通知失败（%s）', type(e).__name__)
 
@@ -2313,6 +2338,7 @@ class TelegramBot:
     # ── Core forward logic ──────────────────────────────────────
 
     async def do_forward(self, event) -> None:
+        epoch = self.task_queue.admission_epoch
         target_id = self.target_chat_id
         gid = getattr(event.message, 'grouped_id', None)
         key = (event.chat_id, gid) if gid is not None else None
@@ -2342,9 +2368,12 @@ class TelegramBot:
             position = await self.task_queue.add_task(
                 event, link, getattr(status_msg, 'id', None), status_chat_id, gid,
                 status_client=getattr(status_msg, 'client', None) or self.client, target_chat_id=target_id,
+                admission_epoch=epoch,
             )
             if position is None:
-                await edit_status(status_msg, self.task_queue.admission_error())
+                reason = self.task_queue.admission_error(admission_epoch=epoch)
+                await edit_status(status_msg, reason)
+                self.schedule_status_delete(status_msg, failed=True)
                 return
             if key is not None:
                 self._album_processed[key] = None
@@ -2440,6 +2469,7 @@ class TelegramBot:
             return True
 
         if command == '/resync':
+            epoch = self.task_queue.admission_epoch
             source_id = mid = None
             if len(parts) == 2:
                 source_id, mid = parse_private_channel_link(parts[1])
@@ -2463,8 +2493,8 @@ class TelegramBot:
                 await respond("⏹️ 服务正在停止，未加入同步队列")
             elif mapped is None:
                 await respond("ℹ️ 当前目标没有转发映射，未修改或补发任何消息")
-            elif await self.task_queue.enqueue_edit(event, source_id, mid, target_id) is None:
-                await respond(self.task_queue.admission_error('未加入同步队列'))
+            elif await self.task_queue.enqueue_edit(event, source_id, mid, target_id, admission_epoch=epoch) is None:
+                await respond(self.task_queue.admission_error('未加入同步队列', admission_epoch=epoch))
             else:
                 await respond(
                     f"⏳ 已加入原地同步队列：{source_id}/{mid}\n"
@@ -2492,7 +2522,7 @@ class TelegramBot:
             current_stopped, cleared = await self.task_queue.stop_tdl_tasks()
             await respond(
                 f"⏹️ 已执行全局停止\n当前 TDL 任务已停止：{'是' if current_stopped else '否'}\n"
-                f"清空等待任务数：{cleared}"
+                f"清空等待任务数：{cleared}" + ("\n若中断时已开始发送，请通过 /queue 核对投递结果。" if current_stopped else "")
             )
             return True
 
@@ -2680,6 +2710,7 @@ class TelegramBot:
             if target_id is None:
                 await respond("❌ 未配置目标频道ID，请先使用 /forwardto 设置")
                 return True
+            epoch = self.task_queue.admission_epoch
             status_msg = await send_status(event, "⏳ 正在加入范围导出队列...")
             if status_msg is not None:
                 self.remember_forward_status(status_msg.chat_id, status_msg.id)
@@ -2690,11 +2721,14 @@ class TelegramBot:
                 message_ids=[start_id, end_id],
                 source_chat_id=chat_id,
                 status_client=getattr(status_msg, 'client', None) or self.client, target_chat_id=target_id,
+                admission_epoch=epoch,
             )
             if position is None:
-                await edit_status(status_msg, self.task_queue.admission_error())
+                reason = self.task_queue.admission_error(admission_epoch=epoch)
+                await edit_status(status_msg, reason)
+                self.schedule_status_delete(status_msg, failed=True)
                 if panel_feedback:
-                    await respond(self.task_queue.admission_error())
+                    await respond(reason)
                 return True
             await edit_status(status_msg,
                 f"⏳ 已加入范围导出队列\n"
@@ -2859,7 +2893,8 @@ class TelegramBot:
             logger.info('[启动/通知] 正在向 %d 位管理员发送启动面板', len(ADMIN_IDS))
         for admin_id in ADMIN_IDS:
             try:
-                await self.admin_panel.open(admin_id, partial(self.client.send_message, admin_id))
+                await asyncio.wait_for(self.admin_panel.open(admin_id, partial(self.client.send_message, admin_id)),
+                                       STATUS_RPC_TIMEOUT)
                 notified += 1
             except Exception as e:
                 logger.warning('[启动/通知] 启动面板发送失败（%s）；不影响 Bot 运行', type(e).__name__)

@@ -1,4 +1,5 @@
 """Startup observability without connecting accounts, invoking TDL or publishing posts."""
+import asyncio
 import sqlite3
 import sys
 import time
@@ -48,6 +49,27 @@ class StartupLogTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
         self.assertIn('启动面板发送失败（ValueError）', out)
         self.assertIn('管理员面板成功 1/2', out)
         self.assertNotIn(app.BOT_TOKEN, out)
+
+    async def test_stalled_admin_panel_does_not_block_readiness_or_next_admin(self):
+        async def open_panel(uid, send):
+            if uid == 10:
+                await asyncio.Future()
+
+        self.bot.admin_panel.open = AsyncMock(side_effect=open_panel)
+        with patch.multiple(app, ADMIN_IDS=[10, 20], STATUS_RPC_TIMEOUT=0.05), self.assertLogs(app.logger, 'INFO') as logs:
+            await asyncio.wait_for(self.bot.start(), 1)
+        self.assertEqual(self.bot.admin_panel.open.await_count, 2)
+        self.assertIn('管理员面板成功 1/2', '\n'.join(logs.output))
+        self.bot.client.run_until_disconnected.assert_awaited_once()
+
+    async def test_stalled_notification_cannot_block_user_monitor_fallback(self):
+        async def send(uid, text):
+            if uid == 10:
+                await asyncio.Future()
+        self.bot.client.send_message.side_effect = send
+        with patch.multiple(app, ADMIN_IDS=[10, 20], STATUS_RPC_TIMEOUT=0.05), self.assertLogs(app.logger, 'ERROR'):
+            await asyncio.wait_for(self.bot.notify_admins('test'), 1)
+        self.assertEqual([c.args[0] for c in self.bot.client.send_message.await_args_list], [10, 20])
 
     async def test_restore_counts_are_measured_not_assumed(self):
         q = self.bot.task_queue
