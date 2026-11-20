@@ -6,6 +6,8 @@ from telethon import errors, functions, types, utils
 
 def media_key(post):
     media = post.media
+    if getattr(media, 'ttl_seconds', None):
+        raise ValueError('限时媒体不支持转存或替换；未生成永久副本')
     if isinstance(media, types.MessageMediaPhoto) and isinstance(media.photo, types.Photo):
         return f'photo:{media.photo.id}:{bool(media.spoiler)}'
     if isinstance(media, types.MessageMediaDocument) and isinstance(media.document, types.Document):
@@ -21,16 +23,18 @@ class AlbumNotReady(ValueError):
 
 async def read_members(client, peer, ids, grouped_id):
     """Read actual grouped IDs, never infer membership from adjacent numeric IDs."""
-    if not ids or len(ids) > 10 or max(ids) - min(ids) > 1000:
+    max_id = 2**31 - 1
+    if (not ids or len(ids) > 10 or not all(type(mid) is int and 1 <= mid <= max_id for mid in ids)
+            or max(ids) - min(ids) > 1000):
         raise ValueError('源消息范围异常，未发送')
     if grouped_id is None:
         posts = await client.get_messages(peer, ids=ids)
     else:
         # Telegram albums have <=10 members. Leave room for interleaved channel posts.
-        low, high = max(1, min(ids) - 100), max(ids) + 100
+        low, high = max(1, min(ids) - 100), min(max_id, max(ids) + 100)
         posts = await client.get_messages(peer, ids=list(range(low, high + 1)))
         posts = [p for p in posts if p and getattr(p, 'grouped_id', None) == grouped_id]
-        if any(p.id == high or (p.id == low and low > 1) for p in posts):
+        if any((p.id == high and high < max_id) or (p.id == low and low > 1) for p in posts):
             raise ValueError('相册成员触及查询边界，未能安全确认整组，未发送')
     found = {p.id: p for p in posts if p and not isinstance(p, types.MessageEmpty)}
     if not set(ids).issubset(found):

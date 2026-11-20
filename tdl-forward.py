@@ -139,6 +139,10 @@ class CopyOutcomeUnknown(Exception):
     """已保留发送意图，不能证明 Telegram 未发送。"""
 
 
+class ClippedTDLRecord(str):
+    """Diagnostic excerpt; the omitted bytes cannot be checked for delivery errors."""
+
+
 class TDLNotStarted(Exception):
     """The OS rejected the executable before it could attempt delivery."""
 
@@ -249,6 +253,10 @@ class TaskQueue:
         if self._loaded:
             return
         rows = self.journal.restore()
+        # Do not rewrite or replay newer/invalid states as pending, even partially.
+        for jid, state, _ in rows:
+            if state not in ('pending', 'early', 'wait_peer', 'wait_album', 'sending', 'review', 'retry_rejected'):
+                raise RuntimeError(f'队列任务 #{jid} 的状态无法识别；已保留原记录，未恢复，请核对数据库或程序版本')
         ready, early, edits = [], {}, {}
         reviewed_members = {}
         for jid, state, fields in rows:
@@ -418,8 +426,10 @@ class TaskQueue:
 
     async def _finish_pending(self, pending, notify: bool) -> int:
         for task in pending:
-            task.status = TaskStatus.FAILED
-            task.error_msg = "已停止并清空等待队列"
+            if task.mode == 'monitor_edit' and task.verify_edit:
+                task.status, task.error_msg = TaskStatus.UNCONFIRMED, '已停止后续核验；此前编辑结果待核对'
+            else:
+                task.status, task.error_msg = TaskStatus.FAILED, '已停止并清空等待队列'
             if task.rejected_copy is not None:
                 try:
                     await self.bot.release_rejected_request(task, task.rejected_copy.request)
@@ -872,7 +882,11 @@ def parse_private_channel_link(text: str) -> tuple[Optional[int], Optional[int]]
     match = re.fullmatch(r"https?://t\.me/c/([1-9][0-9]{0,18})(?:/([0-9]{1,10}))?/?", path)
     if not match:
         return None, None
-    return int(match[1]), int(match[2]) if match[2] is not None else None
+    channel = int(match[1])
+    mid = int(match[2]) if match[2] is not None else None
+    if channel > MAX_CHANNEL_ID or (mid is not None and not 0 < mid < 2**31):
+        return None, None
+    return channel, mid
 
 
 def parse_export_range_args(parts: list[str]) -> tuple[Optional[int], Optional[int], Optional[int], Optional[str]]:
@@ -1005,10 +1019,11 @@ class ForwardLog:
             logger.exception("无法读取转发历史；为保护原件，已停用历史写入")
         return []
 
-    def _prune(self) -> None:
-        if FORWARD_LOG_MAX_DAYS > 0:
-            cutoff = time.time() - FORWARD_LOG_MAX_DAYS * 86400
-            self.logs = [row for row in self.logs if row['timestamp'] > cutoff]
+    def _retained(self) -> list[dict]:
+        if FORWARD_LOG_MAX_DAYS <= 0:
+            return list(self.logs)
+        cutoff = time.time() - FORWARD_LOG_MAX_DAYS * 86400
+        return [row for row in self.logs if row['timestamp'] > cutoff]
 
     def _save(self, snapshot) -> bool:
         if not self.writable:
@@ -1057,11 +1072,14 @@ class ForwardLog:
         with self._disk_lock:
             while True:
                 with self._state_lock:
+                    snapshot = self._retained()
+                    if len(snapshot) != len(self.logs):
+                        self.logs = list(snapshot)  # An add during disk I/O must not mutate the writer's snapshot.
+                        self._version += 1  # Pruning is a write too, even on an otherwise idle shutdown.
                     if self._saved == self._version:
                         self._scheduled = False
                         return True
-                    self._prune()
-                    version, snapshot = self._version, list(self.logs)
+                    version = self._version
                 ok = self._save(snapshot)
                 with self._state_lock:
                     self.write_failed = not ok
@@ -1072,8 +1090,7 @@ class ForwardLog:
 
     def get_all(self) -> list[dict]:
         with self._state_lock:
-            self._prune()
-            return list(self.logs)
+            return self._retained()
 
     def get_recent(self, count: int = 10) -> list[dict]:
         return self.get_all()[-count:] if count > 0 else []
@@ -1371,30 +1388,16 @@ class TDLDownloader:
         - 带查询参数如 ?single 也支持
         返回的 chat_id 为链接中的原始数字，直接供 tdl 使用
         """
-        # 去除可能的空白字符
-        link = link.strip()
-        # 去除查询参数
-        if '?' in link:
-            link = link.split('?')[0]
-        logger.debug(f"解析链接: {link}")
-        patterns = [
-            r"https?://t\.me/([A-Za-z0-9_]+)/(\d+)/?",        # 公开频道
-            r"https?://t\.me/c/(-?\d+)/(\d+)/?",              # 私有频道
-        ]
-        for pattern in patterns:
-            match = re.match(pattern, link)
-            if match:
-                chat_part = match.group(1)
-                msg_id = int(match.group(2))
-                if chat_part.lstrip('-').isdigit():
-                    # 链接中已是 tdl 需要的裸 ID，直接使用
-                    chat_id = int(chat_part)
-                    logger.debug(f"解析成功: chat_id={chat_id}, msg_id={msg_id}")
-                else:
-                    chat_id = None  # 需要用户名解析
-                return chat_id, msg_id
-        logger.warning(f"链接格式不匹配: {link}")
-        return None, None
+        path, _, query = link.strip().partition('?')
+        if targets_submessage(query):
+            return None, None
+        if re.match(r'https?://t\.me/c/', path):
+            return parse_private_channel_link(link.strip())
+        match = re.fullmatch(r'https?://t\.me/([A-Za-z0-9_]+)/([1-9][0-9]{0,9})/?', path)
+        if not match or int(match[2]) >= 2**31:
+            return None, None
+        # Public usernames require lookup; only /c/ paths encode a numeric channel ID.
+        return None, int(match[2])
 
     async def _run_command(
         self,
@@ -1420,21 +1423,26 @@ class TDLDownloader:
             def bounded(record):
                 return record if len(record) <= 2048 else record[:1024] + record[-1024:]
 
-            tail = b""
+            tail, clipped = b"", False
             while True:
                 chunk = await stream.read(8192)
-                # Split bytes, then decode complete records so chunk boundaries don't break UTF-8.
+                # Retain bounded diagnostics, but tell the receipt parser if bytes were lost.
                 parts = (tail + chunk).replace(b"\r", b"\n").split(b"\n")
-                tail = bounded(parts.pop()) if chunk else b""
+                rest = parts.pop() if chunk else b""
                 for line in parts:
                     text = bounded(line).decode("utf-8", errors="replace").strip()
-                    if text:
+                    if clipped or len(line) > 2048:
+                        text = ClippedTDLRecord(text)
+                    clipped = False
+                    if text or isinstance(text, ClippedTDLRecord):
                         collector.append(text)
                         logger.debug("TDL %s: %s", prefix, text)
                         if on_record:
                             on_record(text)  # machine-readable errors must never be dropped with UI updates
                         if progress_callback and (progress_task is None or progress_task.done()):
                             progress_task = asyncio.create_task(deliver_progress(text))
+                clipped = clipped or len(rest) > 2048
+                tail = bounded(rest)
                 if not chunk:
                     return
 
@@ -1606,13 +1614,21 @@ class TDLDownloader:
 
     async def _forward_receipt(self, cmd, progress_callback, *, single=False):
         failed = {}
-        pattern = re.compile(r'\((-?\d+)\):(\d+)\s*->.*?\(-?\d+\)\s+error\s*:\s*(.*)', re.I)
+        clipped = overflow = False
+        sample_limit = 32
+        pattern = re.compile(r'\((-?\d{1,19})\):(\d{1,10})\s*->.*?\(-?\d{1,19}\)\s+error\s*:\s*(.*)', re.I)
 
         def inspect(line):
+            nonlocal clipped, overflow
+            clipped |= isinstance(line, ClippedTDLRecord)
             clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', line)
             match = pattern.search(clean)
             if match:
-                failed[(match[1], match[2])] = match[3][:300]
+                key = (match[1], match[2])
+                if key not in failed and len(failed) >= sample_limit:
+                    overflow = True
+                else:
+                    failed[key] = match[3][:300]
 
         try:
             code, out, err = await self._run_command(cmd, progress_callback, on_record=inspect)
@@ -1625,10 +1641,13 @@ class TDLDownloader:
         if failed:
             ids = ', '.join(f'{src}/{mid}' for src, mid in failed)
             detail = next(iter(failed.values()))
-            text = f'逐条报错 {len(failed)} 条：{ids}（{detail}）'
+            count = f'超过 {sample_limit} 条，仅列前 {sample_limit} 条' if overflow else f'{len(failed)} 条'
+            text = f'逐条报错 {count}：{ids}（{detail}）'
             return False, text if single else UnconfirmedReceipt(text + '；其余消息可能已送达，请核对，不自动重发整批。')
         if code:
             return False, UnconfirmedReceipt(f'TDL 未正常结束（{code}），不能确认投递结果：{err or out}')
+        if clipped:
+            return False, UnconfirmedReceipt('TDL 输出含超长记录，无法排除逐条错误；请核对目标频道，不自动重发。')
         return True, out or 'TDL 已结束，未报告逐条错误。'
 
 
@@ -1678,6 +1697,8 @@ class TelegramBot:
         if query and targets_submessage(query[1]):
             return None
         link = match.group(0)
+        if TDLDownloader.parse_message_link(link)[1] is None:
+            return None
         return None if any(kw in link.lower() for kw in EXCLUDE_KEYWORDS) else link
 
     async def resolve_link(self, event) -> Optional[str]:
@@ -1732,9 +1753,12 @@ class TelegramBot:
                 "/monitor set <源频道裸ID1,源频道裸ID2>\n"
                 "/monitor clear"
             )
-        lines = ["📡 当前自动监听源频道：\n"]
-        for chat_id in self.monitor_chat_ids:
+        total = len(self.monitor_chat_ids)
+        lines = [f"📡 当前自动监听源频道（共 {total} 个）：\n"]
+        for chat_id in self.monitor_chat_ids[:200]:
             lines.append(f"- {chat_id}\n")
+        if total > 200:
+            lines.append(f"… 另有 {total - 200} 个；可在管理面板的「点选移除」中翻页查看。\n")
         if self.is_user_monitor_active():
             lines.append("\n监听客户端：用户账号与 Bot 同时接收，各自使用本账号的频道权限。\n")
         elif self.user_client:
@@ -2072,6 +2096,8 @@ class TelegramBot:
                     mapped = m.get(*task.edit_key)
                     sender_role = m.sender_role(*task.edit_key) if mapped is not None else None
                     cloned_key = m.cloned_media_key(*task.edit_key) if mapped is not None else None
+                    if mapped is None and task.verify_edit:
+                        raise ValueError('原编辑回执未确认，当前目标映射不可用')
                     if mapped is None and m.can_await_mapping(*task.edit_key):
                         self.task_queue.note_early_edit(task)
                 if mapped is None:
@@ -2240,15 +2266,26 @@ class TelegramBot:
                     logger.warning("频道编辑 %s 秒后重试（%s/2）：%s", delay, task.retries, task.link)
                     return
             task.error_msg = str(exc)
-            task.status = (TaskStatus.UNCONFIRMED if task.mode == 'monitor_edit' and task.send_started and
-                           isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError, errors.ServerError,
-                                            errors.TimedOutError)) else TaskStatus.FAILED)
+            # A failed verification does not resolve an earlier edit's lost receipt. Likewise
+            # a failed post-reservation DB write can leave a durable intent without a mapping.
+            ambiguous_rpc = isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError,
+                                             errors.ServerError, errors.TimedOutError))
+            uncertain_edit = task.mode == 'monitor_edit' and (task.verify_edit or (task.send_started and ambiguous_rpc))
+            uncertain_copy = False
+            if task.mode == 'monitor_copy' and task.send_started and isinstance(exc, (sqlite3.Error, OSError)):
+                # If reserve() rolled back before dispatch, there is nothing to review. An intent
+                # left behind by a failed release must remain discoverable even after restart.
+                uncertain_copy = any(self.monitor_message_map().copy_state(source_id, mid, target_id)
+                                     == TaskStatus.UNCONFIRMED for mid in message_ids)
+            task.status = TaskStatus.UNCONFIRMED if uncertain_edit or uncertain_copy else TaskStatus.FAILED
+            if task.status == TaskStatus.UNCONFIRMED:
+                task.error_msg = f'结果待核对，不自动重发：{exc}'
             logger.error("频道同步失败（%s）：%s -> %s: %s", task.mode, task.link, target_id, exc, exc_info=True)
             if task.mode == "monitor_copy":
-                self.forward_log.add(task.link, target_id, False, str(exc))
-                await self.report_monitor_status(f"⚠️ 自动复制失败：{task.link} → {target_id}\n{exc}", failed=True)
+                self.forward_log.add(task.link, target_id, False, task.error_msg)
+                await self.report_monitor_status(f"⚠️ 自动复制：{task.link} → {target_id}\n{task.error_msg}", failed=True)
             else:
-                await self.report_monitor_status(f"⚠️ 频道编辑未同步：{task.link} → {target_id}\n{exc}", failed=True)
+                await self.report_monitor_status(f"⚠️ 频道编辑：{task.link} → {target_id}\n{task.error_msg}", failed=True)
 
     async def start_user_monitor(self) -> None:
         if not USER_MONITOR_ENABLED:
@@ -2291,14 +2328,18 @@ class TelegramBot:
         try:
             await client.connect()
             me = await client.get_me()
-            if me is not None:
+            if me is not None and me.bot:
+                logger.warning('用户监听会话属于 Bot，未作为用户账号启用')
+                await self.notify_admins('⚠️ 用户监听会话属于 Bot，请使用用户账号重新生成；继续使用 Bot 监听。')
+            elif me is not None:
                 self.user_monitor_running = True
                 logger.info("用户账号监听已启动：会话已授权")
                 if not initial:
                     await self.notify_admins("✅ 用户账号监听已恢复，已从仅 Bot 监听切回双账号监听。")
                 return None
-            logger.warning('用户会话未授权或已失效；继续使用 Bot 监听')
-            await self.notify_admins("⚠️ 用户 session 未授权或已失效，请更换并重启；继续使用 Bot 监听。")
+            else:
+                logger.warning('用户会话未授权或已失效；继续使用 Bot 监听')
+                await self.notify_admins("⚠️ 用户 session 未授权或已失效，请更换并重启；继续使用 Bot 监听。")
         except (ConnectionError, TimeoutError, asyncio.TimeoutError, socket.gaierror, errors.ServerError,
                 errors.TimedOutError, errors.FloodWaitError) as exc:
             retry_after = max(USER_MONITOR_RETRY_SECONDS, getattr(exc, 'seconds', 0))
