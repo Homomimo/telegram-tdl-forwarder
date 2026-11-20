@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 FIELDS = ('link', 'status_msg_id', 'chat_id', 'target_chat_id', 'created_at', 'grouped_id',
-          'mode', 'message_ids', 'source_chat_id', 'retries', 'ready_at', 'observer', 'verify_edit', 'refused_role')
+          'mode', 'message_ids', 'source_chat_id', 'retries', 'ready_at', 'observer', 'verify_edit', 'refused_role', 'album_event_ids')
 
 
 class TaskJournal:
@@ -51,10 +51,19 @@ class TaskJournal:
     def cancel_waiters(self, current_id, timer_ids, stop_current=False):
         with self.open() as db:
             db.execute("DELETE FROM jobs WHERE state IN ('pending','early','wait_peer','wait_album') AND id IS NOT ?", (current_id,))
-            db.executemany('DELETE FROM jobs WHERE id=?', [(jid,) for jid in timer_ids])
+            # Those rows are the only recovery handle if cancellation cannot release the map reservation.
+            db.executemany("DELETE FROM jobs WHERE id=? AND state!='retry_rejected'", [(jid,) for jid in timer_ids])
             if stop_current:
                 db.execute("DELETE FROM jobs WHERE id=? AND state='pending'", (current_id,))
                 db.execute("UPDATE jobs SET state='review' WHERE id=? AND state='sending'", (current_id,))
+
+    def reviewed_copy_ids(self, task):
+        return {mid for (mid,) in self.open().execute(
+            "SELECT member.value FROM jobs, json_each(jobs.payload, '$.message_ids') AS member "
+            "WHERE state='review' AND jobs.id != ? "
+            "AND json_extract(payload, '$.mode')='monitor_copy' "
+            "AND json_extract(payload, '$.source_chat_id')=? AND json_extract(payload, '$.target_chat_id')=?",
+            (task.job_id, task.source_chat_id, task.target_chat_id))}
 
     def reviews(self, before=None, limit=5):
         db = self.open()

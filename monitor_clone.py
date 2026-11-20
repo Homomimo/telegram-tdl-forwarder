@@ -128,7 +128,7 @@ def publish_request(peer, posts, media, reserved):
     return functions.messages.SendMediaRequest(**kwargs, media=media[post.id])
 
 
-def receipt_pairs(sent, reserved):
+def receipt_pairs(sent, reserved, *, allow_short=True):
     by_random = {}
     for update in getattr(sent, 'updates', ()):
         if isinstance(update, types.UpdateMessageID) and update.random_id in reserved.values():
@@ -137,7 +137,7 @@ def receipt_pairs(sent, reserved):
             if type(update.id) is not int or update.id <= 0:
                 raise ValueError('目标回执消息 ID 无效')
             by_random[update.random_id] = update.id
-    if isinstance(sent, types.UpdateShortSentMessage) and len(reserved) == 1:
+    if allow_short and isinstance(sent, types.UpdateShortSentMessage) and len(reserved) == 1:
         if type(sent.id) is int and sent.id > 0:
             by_random[next(iter(reserved.values()))] = sent.id
     pairs = {mid: by_random[rid] for mid, rid in reserved.items() if rid in by_random}
