@@ -58,7 +58,7 @@ class PrivatePanelTests(unittest.IsolatedAsyncioTestCase):
 
     def button(self, label):
         markup = TelegramClient.build_reply_markup(self.page.buttons)
-        return next(b.data for row in markup.rows for b in row.buttons if b.text == label)
+        return next(b.type.data for row in markup.rows for b in row.buttons if b.text == label)
 
     async def hit(self, data, uid=UID, chat=UID, mid=None, via_inline=False):
         ev = NS(data=data, sender_id=uid, chat_id=chat, message_id=self.session.mid if mid is None else mid,

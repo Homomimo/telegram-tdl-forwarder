@@ -189,12 +189,21 @@ docker compose up -d --build telegram-bot
 
 ### 离线测试
 
-在 Python 3.10 环境中运行，无需真实 Telegram 凭据：
+容器使用 Python 3.14 和 Telethon 1.46.0，不需要升级宿主机的 Python。在本地运行离线测试时，请使用 Python 3.14 的虚拟环境，无需真实 Telegram 凭据：
 
 ```bash
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
+
+也可以在 Linux 宿主机用实际部署镜像运行同一套测试；下面的命令只挂载测试目录，不读取 `.env` 或生产数据卷：
+
+```bash
+docker build --pull -t tdl-forwarder:test .
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" tdl-forwarder:test python -B -m unittest discover -s tests -v
+```
+
+升级后先在测试频道验证三件事：管理面板按钮能响应；两张图片能作为一个相册自动复制；修改其中一张的说明后，只更新对应的目标帖，不新增帖子。
 
 ### 许可证
 

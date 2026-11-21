@@ -122,7 +122,7 @@ def monitor_visual_media(media) -> Optional[types.InputMediaPhoto | types.InputM
         result = utils.get_input_media(media)
     else:
         return None
-    # Telethon 1.28.5 的 get_input_media 保留文件引用和 TTL，但不复制剧透标记。
+    # 显式沿用源帖的剧透标记。
     result.spoiler = media.spoiler
     return result
 
