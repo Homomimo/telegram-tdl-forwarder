@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 FIELDS = ('link', 'status_msg_id', 'chat_id', 'target_chat_id', 'created_at', 'grouped_id',
-          'mode', 'message_ids', 'source_chat_id', 'retries', 'ready_at', 'observer', 'verify_edit', 'refused_role', 'album_event_ids')
+          'mode', 'message_ids', 'source_chat_id', 'retries', 'store_retries', 'ready_at', 'observer',
+          'verify_edit', 'edit_media_intent', 'refused_role', 'album_event_ids')
 
 
 class TaskJournal:
@@ -51,10 +52,10 @@ class TaskJournal:
     def cancel_waiters(self, current_id, timer_ids, stop_current=False):
         with self.open() as db:
             # Cancel the future verification, not the evidence of an earlier in-flight edit.
-            db.execute("UPDATE jobs SET state='review' WHERE state IN ('pending','wait_peer') AND id IS NOT ? "
+            db.execute("UPDATE jobs SET state='review' WHERE state IN ('pending','wait_peer','wait_store') AND id IS NOT ? "
                        "AND json_extract(payload,'$.mode')='monitor_edit' AND json_extract(payload,'$.verify_edit')=1",
                        (current_id,))
-            db.execute("DELETE FROM jobs WHERE state IN ('pending','early','wait_peer','wait_album') AND id IS NOT ?", (current_id,))
+            db.execute("DELETE FROM jobs WHERE state IN ('pending','early','wait_peer','wait_album','wait_store') AND id IS NOT ?", (current_id,))
             # Those rows are the only recovery handle if cancellation cannot release the map reservation.
             db.executemany("DELETE FROM jobs WHERE id=? AND state NOT IN ('review','retry_rejected')", [(jid,) for jid in timer_ids])
             if stop_current:

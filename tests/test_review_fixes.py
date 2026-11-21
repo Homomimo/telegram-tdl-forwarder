@@ -20,12 +20,14 @@ class ReviewFixTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
                 Path(cmd[cmd.index('-o') + 1]).write_text(json.dumps(
                     rows if '--all' in cmd else rows[1:]))
             else:
+                self.assertIn('--single', cmd)  # Otherwise TDL could add album members outside 11..12.
                 forwarded.extend(json.loads(Path(cmd[cmd.index('--from') + 1]).read_text()))
             return 0, '', ''
         self.bot.tdl._run_command = tdl
         await self.bot.task_queue.add_task(self.event(11), 'range', None, 1, mode='export_range',
             message_ids=[11, 12], source_chat_id=SOURCE, target_chat_id=TARGET)
-        self.assertEqual((await self.process()).status, app.TaskStatus.COMPLETED)
+        self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)
+        self.assertEqual(self.bot.task_queue.journal.reviews()[1][0]['message_ids'], [11, 12])
         self.assertEqual([row['id'] for row in forwarded], [11, 12])
 
     async def test_timer_before_album_event_never_sends_subset(self):

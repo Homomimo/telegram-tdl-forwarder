@@ -143,6 +143,126 @@ class RecoveryTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
         self.bot.task_queue._restore()
         return self.bot.task_queue
 
+    async def test_manual_link_scope_survives_restart_and_silent_tdl_is_reviewed(self):
+        base = f'https://t.me/c/{SOURCE}/8'
+        submitted_target = self.bot.target_chat_id
+        for suffix, expected in [('?embed=1&single', '?single'), ('', '')]:
+            ev = self.event(8)
+            ev.message.text = base + suffix
+            ev.respond = AsyncMock(return_value=None)
+            await self.bot.do_forward(ev)
+            self.assertEqual(self.bot.task_queue.journal.restore()[-1][2]['link'], base + expected)
+        for query in ('single&comment=7', 'thread=2&single'):
+            self.assertIsNone(self.bot.extract_link(base + '?' + query))
+        q = await self.reopen()
+        with patch.object(self.bot.tdl, '_run_command', return_value=(0, '', '')) as run:
+            for single in (True, False):
+                task = await self.process()
+                argv = run.await_args.args[0]
+                self.assertEqual(argv[argv.index('--from')+1], base)
+                self.assertEqual('--single' in argv, single)
+                self.assertEqual(task.status, app.TaskStatus.UNCONFIRMED)
+                self.assertIsInstance(task.error_msg, app.UnconfirmedReceipt)
+                self.assertFalse(self.bot.forward_log.add.call_args.args[2])
+                self.assertEqual(task.target_chat_id, submitted_target)
+        self.assertEqual(q.journal.reviews()[0], 2)
+        q = await self.reopen()
+        self.assertTrue(q.queue.empty())
+        self.assertEqual(q.journal.reviews()[0], 2)
+
+    async def test_range_single_flag_is_not_single_input_evidence(self):
+        output = f'Source({SOURCE}):8 -> Target({TARGET}) error: denied'
+        with patch.object(self.bot.tdl, '_run_command', return_value=(0, output, '')) as run:
+            for fn, arg, batch in [(self.bot.tdl.forward_from_export, 'export.json', True),
+                                   (self.bot.tdl.forward_clone, f'https://t.me/c/{SOURCE}/8?single', False)]:
+                ok, detail = await fn(arg, TARGET)
+                self.assertFalse(ok)
+                self.assertIn('--single', run.await_args.args[0])
+                self.assertEqual(isinstance(detail, app.UnconfirmedReceipt), batch)
+
+    async def test_shutdown_with_rejected_flood_request_restores_to_review(self):
+        self.bot.client.forward.side_effect = app.errors.FloodWaitError(None, capture=60)
+        await self.enqueue(self.event(8))
+        task = await self.process()
+        original = self.bot.client.forward.await_args.args[0]
+        q = await self.reopen()
+        self.assertTrue(q.queue.empty())
+        self.assertFalse(q._retry_timers)
+        count, rows = q.journal.reviews()
+        self.assertEqual((count, rows[0]['job_id'], rows[0]['target_chat_id']), (1, task.job_id, TARGET))
+        self.assertEqual(rows[0]['ready_at'], task.ready_at)
+        m = self.bot.monitor_message_map()
+        self.assertEqual(m.db.execute('SELECT random_id FROM monitor_copy_intents').fetchone()[0], original.random_id[0])
+        self.bot.client.forward.assert_not_awaited()
+
+    async def test_persistent_read_lock_parks_job_until_restart(self):
+        q = self.bot.task_queue
+        self.bot.monitor_message_map().db.execute('PRAGMA busy_timeout=0')
+        self.bot.report_monitor_status = AsyncMock()
+        await self.enqueue(self.event(8))
+        locker = sqlite3.connect(app.MONITOR_MAP_FILE)
+        try:
+            locker.execute('BEGIN EXCLUSIVE')
+            for attempt in range(3):
+                task = await self.process()
+                self.assertEqual(task.status, app.TaskStatus.PENDING)
+                self.assertFalse(task.send_started)
+                self.assertEqual(task.retries, 0)  # FloodWait and album retries still have their own budget.
+                if attempt < 2:
+                    timer, waiting = q._retry_timers.popitem()
+                    timer.cancel(); q.queue.put_nowait(waiting)
+            self.assertFalse(q._retry_timers)
+            self.assertEqual(q.get_queue_status()['waiting_for_store'], 1)
+            self.assertEqual(q.journal.restore()[0][:2], (task.job_id, 'wait_store'))
+            self.bot.client.forward.assert_not_awaited()
+        finally:
+            locker.close()
+        await self.reopen()
+        restored = await self.process()
+        self.assertEqual((restored.job_id, restored.target_chat_id, restored.status), (task.job_id, TARGET, app.TaskStatus.COMPLETED))
+        self.bot.client.forward.assert_awaited_once()
+
+    async def test_write_lock_at_reserve_is_before_send(self):
+        q = self.bot.task_queue
+        m = self.bot.monitor_message_map()
+        m.db.execute('PRAGMA busy_timeout=0')
+        await self.enqueue(self.event(9))
+        locker = sqlite3.connect(app.MONITOR_MAP_FILE)
+        try:
+            locker.execute('BEGIN IMMEDIATE')  # Reads work; the reservation transaction cannot begin.
+            task = await self.process()
+            self.assertEqual(q.journal.restore()[0][1], 'pending')
+            self.assertFalse(task.send_started)
+            self.assertEqual(m.copy_state(SOURCE, 9, TARGET), app.TaskStatus.PENDING)
+            self.bot.client.forward.assert_not_awaited()
+        finally:
+            locker.close()
+        timer, waiting = q._retry_timers.popitem()
+        timer.cancel(); q.queue.put_nowait(waiting)
+        self.assertEqual((await self.process()).status, app.TaskStatus.COMPLETED)
+        self.bot.client.forward.assert_awaited_once()
+
+    async def test_lock_after_dispatch_is_reviewed_not_retried(self):
+        q, client = self.bot.task_queue, self.bot.client
+        self.bot.monitor_message_map().db.execute('PRAGMA busy_timeout=0')
+        locker = sqlite3.connect(app.MONITOR_MAP_FILE)
+        def delivered(request):
+            locker.execute('BEGIN EXCLUSIVE')
+            return client.forward_response(request)
+        client.forward.side_effect = delivered
+        try:
+            await self.enqueue(self.event(10))
+            with self.assertLogs(app.logger, 'ERROR'):
+                self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)
+            self.assertEqual(q.journal.reviews()[0], 1)
+            self.assertFalse(q._retry_timers)
+        finally:
+            locker.close()
+        client.forward.assert_awaited_once()
+        q = await self.reopen()
+        self.assertTrue(q.queue.empty())
+        self.assertEqual(q.journal.reviews()[1][0]['message_ids'], [10])
+
     async def test_precise_cleanup_keeps_gaps_and_legacy_uncertainty(self):
         m = self.bot.monitor_message_map()
         m.remember(SOURCE, TARGET, {100: 800, 102: 802})

@@ -72,13 +72,18 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
 
     async def test_album_one_request_exact_members_and_random_id_mapping(self):
         self.restrict(photo(3, 99), photo(7, 99), photo(12, 99))
+        self.bot.report_monitor_status = AsyncMock()
         original_read = self.read
         async def read(peer, *, ids):
             return [text(8), *(await original_read(peer, ids=ids))] if len(ids) > 10 else await original_read(peer, ids=ids)
         self.bot.client.get_messages.side_effect = read
         await self.enqueue(self.event(3, 7, 12, album=99))
         self.assertEqual((await self.process()).status, app.TaskStatus.COMPLETED)
+        self.bot.forward_log.add.assert_called_once_with(f'https://t.me/c/{SOURCE}/3', TARGET, True,
+                                                         target_message_id=509)
         req, = self.publications()
+        self.assertEqual(self.bot.report_monitor_status.await_args.args[0].splitlines()[1:],
+                         [f'https://t.me/c/{TARGET}/{mid}?single' for mid in (509, 521, 536)])
         self.assertEqual([m.message for m in req.multi_media], ['caption'] * 3)
         self.assertTrue(all(m.entities == [T.MessageEntityBold(0, 3)] for m in req.multi_media))
         self.assertEqual([self.bot.monitor_message_map().get(SOURCE, i, TARGET) for i in (3,7,12)], [509,521,536])
@@ -125,6 +130,67 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         self.assertIsInstance(self.bot.client.edit_message.await_args.kwargs['file'], T.InputMediaPhoto)
         self.assertEqual(self.bot.tdl.download_media.await_count, 2)
         self.assertEqual(len(self.publications()), 1)
+
+    async def recover_lost_media_edit(self, *, revert_source):
+        self.restrict(photo(5, media_id=101))
+        async def upload_or_publish(req):
+            if isinstance(req, F.UploadMediaRequest):
+                # A freshly uploaded Telegram object is NOT the source attachment ID.
+                return photo(5, media_id=self.posts[5].media.photo.id + 1000).media
+            return await self.rpc(req)
+        self.bot.client.forward.side_effect = upload_or_publish
+        await self.enqueue(self.event(5)); await self.process()
+        self.assertEqual(self.bot.monitor_message_map().cloned_media_keys(SOURCE, 5, TARGET),
+                         ('photo:101:False', 'photo:1101:False'))
+        self.posts[515] = photo(515, media_id=1101)
+        async def apply_but_lose_reply(peer, mid, *, file, **kwargs):
+            self.posts[mid] = photo(mid, media_id=file.id.id)
+            raise ConnectionError('lost edit acknowledgement')
+        self.bot.client.edit_message.side_effect = apply_but_lose_reply
+        self.posts[5] = photo(5, media_id=202)
+        await self.enqueue(self.event(5), edited=True)
+        task = await self.process()
+        self.assertEqual(task.status, app.TaskStatus.PENDING)
+        self.assertEqual(self.posts[515].media.photo.id, 1202)
+        _, _, saved = self.bot.task_queue.journal.restore()[0]
+        self.assertEqual(saved['edit_media_intent'], ['photo:202:False', 'photo:1202:False'])
+        await self.bot.stop()
+        self.bot = self.make_bot()
+        self.restrict(photo(5, media_id=101 if revert_source else 202), photo(515, media_id=1202))
+        self.bot.client.forward.side_effect = upload_or_publish
+        with patch.object(app.time, 'time', return_value=task.ready_at + 1):
+            self.bot.task_queue._restore()
+        self.assertEqual((await self.process()).status, app.TaskStatus.COMPLETED)
+        self.assertEqual(self.bot.task_queue.journal.reviews()[0], 0)
+        self.assertEqual(self.publications(), [])
+
+    async def test_reverted_source_media_with_same_caption_repairs_mapped_target(self):
+        await self.recover_lost_media_edit(revert_source=True)
+        edit = self.bot.client.edit_message.await_args
+        self.assertEqual((edit.args[1], edit.kwargs['file'].id.id), (515, 1101))
+        self.assertEqual(self.bot.monitor_message_map().cloned_media_keys(SOURCE, 5, TARGET),
+                         ('photo:101:False', 'photo:1101:False'))
+
+    async def test_lost_edit_verified_from_target_fingerprint_without_reupload(self):
+        await self.recover_lost_media_edit(revert_source=False)
+        self.bot.client.edit_message.assert_not_awaited()
+        self.bot.tdl.download_media.assert_not_awaited()
+        self.assertEqual(self.bot.monitor_message_map().cloned_media_keys(SOURCE, 5, TARGET),
+                         ('photo:202:False', 'photo:1202:False'))
+
+    async def test_legacy_cloned_media_without_target_key_stays_in_review(self):
+        self.restrict(photo(5), photo(515, media_id=111))
+        self.bot.monitor_message_map().remember(SOURCE, TARGET, {5: 515}, 'bot', {5: 'photo:5:False'})
+        await self.enqueue(self.event(5), edited=True)
+        q = self.bot.task_queue
+        task = q.queue.get_nowait(); q.queue.task_done(); q.begin_send(task)
+        q._loaded = False
+        q._restore()  # Older interrupted job: no journaled upload reference either.
+        with self.assertLogs(app.logger, 'ERROR'):
+            self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)
+        self.assertEqual(q.journal.reviews()[0], 1)
+        self.bot.client.edit_message.assert_not_awaited()
+        self.bot.client.forward.assert_not_awaited()
 
     async def test_text_only_uses_send_message(self):
         self.restrict(text(5))
@@ -200,7 +266,7 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         self.restrict(photo(5))
         await self.enqueue(self.event(5)); await self.process()
         mapping = self.bot.monitor_message_map()
-        old_key = mapping.cloned_media_key(SOURCE, 5, TARGET)
+        old_key = mapping.cloned_media_keys(SOURCE, 5, TARGET)[0]
         self.posts[5] = photo(5, media_id=55)
         self.bot.client.forward.side_effect = app.errors.PhotoExtInvalidError(None)
         await self.enqueue(self.event(5), edited=True)
@@ -210,7 +276,7 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         self.assertIn('未修改已有目标帖', task.error_msg)
         self.bot.client.edit_message.assert_not_awaited()
         self.assertEqual(mapping.get(SOURCE, 5, TARGET), 515)
-        self.assertEqual(mapping.cloned_media_key(SOURCE, 5, TARGET), old_key)
+        self.assertEqual(mapping.cloned_media_keys(SOURCE, 5, TARGET)[0], old_key)
 
     async def test_missing_member_is_not_dropped(self):
         self.restrict(photo(3, 99))
@@ -229,6 +295,7 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         self.assertFalse(self.publications())
 
     async def test_partial_receipt_maps_only_confirmed_no_resend(self):
+        self.bot.report_monitor_status = AsyncMock()
         self.restrict(photo(3, 99), photo(7, 99))
         async def rpc(req):
             if isinstance(req, F.SendMultiMediaRequest):
@@ -238,6 +305,9 @@ class RestrictedCloneTests(fixtures.MonitorHarness, unittest.IsolatedAsyncioTest
         await self.enqueue(self.event(3, 7, album=99))
         with self.assertLogs(app.logger, 'ERROR'):
             self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)
+        notice = self.bot.report_monitor_status.await_args.args[0]
+        self.assertIn('TDL 回退上传：部分消息已确认，其余待核对。不会自动重发。\n待核对的源消息 ID：[7]', notice)
+        self.assertEqual(notice.split('已确认的成员：\n')[1], f'源消息 3 → https://t.me/c/{TARGET}/99?single')
         self.assertEqual([self.state(i) for i in (3,7)], [app.TaskStatus.COMPLETED, app.TaskStatus.UNCONFIRMED])
         await self.enqueue(self.event(3, 7, album=99))
         self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)

@@ -26,7 +26,7 @@ from functools import partial
 
 from admin_panel import AdminPanel
 from task_journal import TaskJournal
-from monitor_clone import AlbumNotReady, read_members, media_key, source_posts, upload_batch, publish_request, receipt_pairs
+from monitor_clone import AlbumNotReady, read_members, media_key, source_posts, upload_batch, uploaded_media_key, publish_request, receipt_pairs
 
 # ─────────────────────────── Logging ───────────────────────────
 logger = logging.getLogger(__name__)
@@ -135,8 +135,23 @@ class TaskStatus(Enum):
     UNCONFIRMED = "unconfirmed"
 
 
+def target_post_ref(channel_id: int, message_id: Optional[int], *, album_member=False) -> str:
+    if type(message_id) is int and 0 < message_id < 2**31 and 0 < channel_id <= MAX_CHANNEL_ID:
+        return f'https://t.me/c/{channel_id}/{message_id}' + ('?single' if album_member else '')
+    return str(channel_id)
+
+
 class CopyOutcomeUnknown(Exception):
     """已保留发送意图，不能证明 Telegram 未发送。"""
+
+    def __init__(self, message: str, *, confirmed_pairs: Optional[dict[int, int]] = None):
+        super().__init__(message)
+        self.confirmed_pairs = confirmed_pairs or {}
+
+    @classmethod
+    def missing_confirmations(cls, operation, unknown, pairs):
+        status = '部分消息已确认，其余待核对' if pairs else '尚未确认消息是否送达'
+        return cls(f'{operation}：{status}。不会自动重发。\n待核对的源消息 ID：{unknown}', confirmed_pairs=pairs)
 
 
 class ClippedTDLRecord(str):
@@ -149,6 +164,17 @@ class TDLNotStarted(Exception):
 
 class UnconfirmedReceipt(str):
     """TDL diagnostics without proof of complete delivery (still JSON-compatible)."""
+
+
+def sqlite_is_busy(exc) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, 'sqlite_errorcode', None)
+    if code is not None:
+        return (code & 0xff) in (5, 6)  # SQLITE_BUSY / SQLITE_LOCKED, including extended codes.
+    # Python 3.10 has no sqlite_errorcode. Only recognize SQLite's lock messages.
+    return str(exc).lower().partition(':')[0] in {
+        'database is locked', 'database is busy', 'database table is locked', 'database schema is locked'}
 
 
 class MonitorPeerMissing(Exception):
@@ -179,6 +205,7 @@ class ForwardTask:
     message_ids: Optional[list[int]] = None
     source_chat_id: Optional[int] = None
     retries: int = 0
+    store_retries: int = 0  # Lock contention must not consume RPC/album retry budgets.
     edit_dirty: bool = False
     # Only set while waiting after an explicit RPC rejection, never during an in-flight send.
     rejected_copy: Optional[RejectedCopy] = None
@@ -188,6 +215,7 @@ class ForwardTask:
     followup: Optional['ForwardTask'] = None
     observer: Optional[str] = None  # Account role only. Never persist a session or access hash.
     verify_edit: bool = False
+    edit_media_intent: Optional[list[str]] = None  # Source and uploaded target keys for an interrupted edit.
     waiting_for_album: bool = False  # transient: restored waiters re-read the source once
     delivery_recorded: bool = False
     refused_role: Optional[str] = None
@@ -232,6 +260,7 @@ class TaskQueue:
         self.journal = TaskJournal(MONITOR_MAP_FILE)
         self._loaded = False
         self._peer_wait = {}
+        self._store_wait = {}  # Retry on restart, not on every new channel event.
         self.admission_epoch = 0
 
     def record_copy_result(self, task, unresolved, *, represented=None, already_review=False):
@@ -255,17 +284,19 @@ class TaskQueue:
         rows = self.journal.restore()
         # Do not rewrite or replay newer/invalid states as pending, even partially.
         for jid, state, _ in rows:
-            if state not in ('pending', 'early', 'wait_peer', 'wait_album', 'sending', 'review', 'retry_rejected'):
+            if state not in ('pending', 'early', 'wait_peer', 'wait_album', 'wait_store', 'sending', 'review', 'retry_rejected'):
                 raise RuntimeError(f'队列任务 #{jid} 的状态无法识别；已保留原记录，未恢复，请核对数据库或程序版本')
         ready, early, edits = [], {}, {}
         reviewed_members = {}
         for jid, state, fields in rows:
             task = ForwardTask(event=None, job_id=jid, **fields)
+            if state == 'wait_store':
+                task.store_retries = 0
             if state in ('sending', 'review', 'retry_rejected'):
                 if task.mode == 'monitor_copy':
                     m = self.bot.monitor_message_map()
-                    # A cancelled rejected retry stays in the journal until its reservation is gone.
-                    # If release committed before a crash, there is nothing left to send or review.
+                    # A FloodWait request is account-bound: on restart review its retained intent, never replay it.
+                    # Explicit /tdlstop may already have released it before a crash; then there is nothing to review.
                     unresolved_states = {TaskStatus.UNCONFIRMED}
                     if state != 'retry_rejected':
                         unresolved_states.add(TaskStatus.PENDING)
@@ -333,18 +364,9 @@ class TaskQueue:
             if self.worker_task and not self.worker_task.done():
                 self.worker_task.cancel()
                 await asyncio.gather(self.worker_task, return_exceptions=True)
-            pending = self._take_pending()
-            for task in pending:
-                if task.rejected_copy is not None:
-                    # Do not reconstruct an already attempted, account-bound RPC on restart.
-                    task.status, task.error_msg = TaskStatus.FAILED, '已停止等待限流重试，未再次发送'
-                    try:
-                        await self.bot.release_rejected_request(task, task.rejected_copy.request)
-                        self.journal.discard([task.job_id])
-                        task.rejected_copy = None
-                    except (sqlite3.Error, OSError):
-                        task.error_msg += '；无法释放发送记录，须人工核对'
-                        logger.exception('无法释放限流预约；保留待核对记录')
+            # Service shutdown is not an operator cancellation. In particular, keep a
+            # retry_rejected row and its account-bound reservation for recovery into review.
+            self._take_pending()
             self._edits.clear()
             self.journal.close()
             self._loaded = False
@@ -359,8 +381,11 @@ class TaskQueue:
                 logger.debug("无法读取状态提示：%s", type(exc).__name__)
         return None
 
-    def retry_later(self, task: ForwardTask, delay: float) -> None:
-        task.retries += 1
+    def retry_later(self, task: ForwardTask, delay: float, *, store=False) -> None:
+        if store:
+            task.store_retries += 1
+        else:
+            task.retries += 1
         task.ready_at = time.time() + delay
         state = 'retry_rejected' if task.rejected_copy is not None else 'sending' if task.send_started else 'pending'
         self.journal.save(task, state)
@@ -387,6 +412,8 @@ class TaskQueue:
 
     def _take_pending(self) -> list[ForwardTask]:
         pending = list(self._retry_timers.values())
+        pending.extend(self._store_wait.values())
+        self._store_wait.clear()
         pending.extend(self._peer_wait.values())
         self._peer_wait.clear()
         for task, timer in self._albums.values():
@@ -670,8 +697,16 @@ class TaskQueue:
             return
         if task.status == TaskStatus.UNCONFIRMED:
             if task.mode == 'monitor_copy':
-                self.record_copy_result(task, [mid for mid in task.message_ids if self.bot.monitor_message_map().copy_state(
-                    task.source_chat_id, mid, task.target_chat_id) != TaskStatus.COMPLETED])
+                try:
+                    unresolved = [mid for mid in task.message_ids if self.bot.monitor_message_map().copy_state(
+                        task.source_chat_id, mid, task.target_chat_id) != TaskStatus.COMPLETED]
+                except sqlite3.OperationalError as exc:
+                    if not sqlite_is_busy(exc):
+                        raise
+                    # Post-dispatch lock: keep the whole job. Recovery can narrow it when the map is readable.
+                    self.journal.save(task, 'review')
+                else:
+                    self.record_copy_result(task, unresolved)
             else:
                 self.journal.save(task, 'review')
         elif task.status != TaskStatus.PENDING and not (
@@ -760,7 +795,8 @@ class TaskQueue:
     def get_queue_status(self) -> dict:
         return {
             "queue_size": (self.queue.qsize() + len(self._retry_timers) + len(self._albums)
-                           + len(self._peer_wait) + self._held_edit_count()),
+                           + len(self._peer_wait) + len(self._store_wait) + self._held_edit_count()),
+            "waiting_for_store": len(self._store_wait),
             "current_task": {
                 "link": self.current_task.link[:50] if self.current_task else None,
                 "status": self.current_task.status.value if self.current_task else None
@@ -1049,13 +1085,18 @@ class ForwardLog:
                 except OSError:
                     logger.warning("无法清除转发历史临时文件：%s", tmp)
 
-    def add(self, from_link: str, to_chat_id: int, success: bool, error_msg: str = "") -> str:
+    def add(self, from_link: str, to_chat_id: int, success: bool, error_msg: str = "", *,
+            target_message_id: Optional[int] = None) -> str:
         with self._state_lock:
             self._last_id += 1
             record_id = str(self._last_id)
-            self.logs.append(dict(id=record_id, to=to_chat_id, success=success, error=error_msg,
-                                  timestamp=time.time(), date=time.strftime('%Y-%m-%d %H:%M:%S'),
-                                  **{'from': from_link}))
+            row = dict(id=record_id, to=to_chat_id, success=success, error=error_msg,
+                       timestamp=time.time(), date=time.strftime('%Y-%m-%d %H:%M:%S'), **{'from': from_link})
+            if isinstance(error_msg, UnconfirmedReceipt):
+                row['unconfirmed'] = True
+            if target_message_id is not None:
+                row['target_message_id'] = target_message_id
+            self.logs.append(row)
             self._version += 1
             if self._scheduled:
                 return record_id
@@ -1129,10 +1170,13 @@ def format_recent_history(rows: list[dict], total: int) -> str:
     rows = rows[-10:]
     lines = ['📝 转发记录（最新在前）：']
     for row in reversed(rows):
-        entry = (f"{'✅' if row['success'] else '❌'} #{clip(row['id'], 24)}\n"
-                 f"FROM: {clip(row['from'], 110)}\nTO:   {clip(row['to'], 24)}\n📅 {clip(row['date'], 24)}")
+        target = target_post_ref(row['to'], row.get('target_message_id')) if row['success'] else str(row['to'])
+        pending = not row['success'] and row.get('unconfirmed') is True
+        icon = '✅' if row['success'] else '⚠️' if pending else '❌'
+        entry = (f"{icon} #{clip(row['id'], 24)}\n"
+                 f"FROM: {clip(row['from'], 110)}\nTO:   {clip(target, 50)}\n📅 {clip(row['date'], 24)}")
         if not row['success']:
-            entry += '\n错误: ' + clip(row['error'], 1500 // len(rows), tail=True)
+            entry += ('\n待核对: ' if pending else '\n错误: ') + clip(row['error'], 1500 // len(rows), tail=True)
         lines.append(entry)
     lines.append(f'共 {total} 条记录')
     return '\n\n'.join(lines)
@@ -1178,6 +1222,10 @@ class MonitorMessageMap:
                 """)
                 if 'cloned_media_key' not in columns:
                     self.db.execute('ALTER TABLE monitor_messages ADD COLUMN cloned_media_key TEXT')
+                if 'target_media_key' not in columns:
+                    self.db.execute('ALTER TABLE monitor_messages ADD COLUMN target_media_key TEXT')
+                if 'album_member' not in columns:
+                    self.db.execute('ALTER TABLE monitor_messages ADD COLUMN album_member INTEGER NOT NULL DEFAULT 0')
                 # Legacy TDL CLI completions have no target ID; preserve their deduplication records.
                 self.db.execute("""
                     CREATE TABLE IF NOT EXISTS monitor_copy_intents (
@@ -1201,12 +1249,15 @@ class MonitorMessageMap:
             raise
 
     def get(self, source_chat_id: int, source_message_id: int, target_chat_id: int) -> Optional[int]:
+        return self.mapped_post(source_chat_id, source_message_id, target_chat_id)[0]
+
+    def mapped_post(self, source_chat_id, source_message_id, target_chat_id):
         row = self.db.execute(
-            "SELECT target_message_id FROM monitor_messages "
+            "SELECT target_message_id,album_member FROM monitor_messages "
             "WHERE source_chat_id = ? AND source_message_id = ? AND target_chat_id = ?",
             (source_chat_id, source_message_id, target_chat_id),
         ).fetchone()
-        return row[0] if row else None
+        return row or (None, False)
 
     def copy_state(self, source_chat_id: int, source_message_id: int, target_chat_id: int) -> TaskStatus:
         # A missing receipt is still unresolved even if a higher message ID has since expired.
@@ -1242,15 +1293,15 @@ class MonitorMessageMap:
                               'AND source_message_id=? AND target_chat_id=?', (source_id, mid, target_id)).fetchone()
         return row[0] if row else None
 
-    def cloned_media_key(self, source_id, mid, target_id):
-        row = self.db.execute('SELECT cloned_media_key FROM monitor_messages WHERE source_chat_id=? '
+    def cloned_media_keys(self, source_id, mid, target_id):
+        row = self.db.execute('SELECT cloned_media_key,target_media_key FROM monitor_messages WHERE source_chat_id=? '
                              'AND source_message_id=? AND target_chat_id=?', (source_id, mid, target_id)).fetchone()
-        return row[0] if row else None
+        return row or (None, None)
 
-    def update_cloned_media_key(self, source_id, mid, target_id, key):
+    def update_cloned_media_keys(self, source_id, mid, target_id, key, target_key):
         with self.db:
-            self.db.execute('UPDATE monitor_messages SET cloned_media_key=? WHERE source_chat_id=? '
-                            'AND source_message_id=? AND target_chat_id=?', (key, source_id, mid, target_id))
+            self.db.execute('UPDATE monitor_messages SET cloned_media_key=?,target_media_key=? WHERE source_chat_id=? '
+                            'AND source_message_id=? AND target_chat_id=?', (key, target_key, source_id, mid, target_id))
 
     def batch_copy_state(self, source_id: int, target_id: int, ids: list[int], *, whole_album=False) -> TaskStatus:
         states = {self.copy_state(source_id, mid, target_id) for mid in ids}
@@ -1350,13 +1401,13 @@ class MonitorMessageMap:
             )
 
     def remember(self, source_chat_id: int, target_chat_id: int, pairs: dict[int, int], sender_role=None,
-                 cloned_media_keys=None) -> None:
+                 cloned_media_keys=None, target_media_keys=None, *, album_member=False) -> None:
         with self.db:
             self.db.executemany(
-                "INSERT INTO monitor_messages (source_chat_id,source_message_id,target_chat_id,target_message_id,confirmed_at,sender_role,cloned_media_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO monitor_messages (source_chat_id,source_message_id,target_chat_id,target_message_id,confirmed_at,sender_role,cloned_media_key,target_media_key,album_member) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [(source_chat_id, src, target_chat_id, dst, int(time.time()), sender_role,
-                  (cloned_media_keys or {}).get(src)) for src, dst in pairs.items()],
+                  (cloned_media_keys or {}).get(src), (target_media_keys or {}).get(src), album_member) for src, dst in pairs.items()],
             )
             self.db.executemany(
                 "DELETE FROM monitor_copy_intents WHERE source_chat_id=? AND source_message_id=? AND target_chat_id=?",
@@ -1581,7 +1632,7 @@ class TDLDownloader:
             "--from", export_file,
             "--to", to_arg,
             "--mode", "clone",
-            "--desc",
+            "--desc", "--single",  # Do not expand beyond the exported IDs. The input is still a batch.
         ]
         return await self._forward_receipt(cmd, progress_callback)
 
@@ -1595,12 +1646,13 @@ class TDLDownloader:
         to_arg = self.normalize_chat_id(to_chat_id)
         cmd = [
             self.tdl_path, "forward",
-            "--from", from_link,
+            "--from", from_link.removesuffix("?single"),
             "--to", to_arg,
             "--mode", "clone",
         ]
+        single = single or from_link.endswith('?single')  # extract_link persists the canonical form.
         if single:
-            cmd.append("--single")  # Do not expand a monitored member into its whole album.
+            cmd.append("--single")
         return await self._forward_receipt(cmd, progress_callback, single=single)
 
     async def download_media(self, link: str, output_file: str) -> None:
@@ -1648,7 +1700,7 @@ class TDLDownloader:
             return False, UnconfirmedReceipt(f'TDL 未正常结束（{code}），不能确认投递结果：{err or out}')
         if clipped:
             return False, UnconfirmedReceipt('TDL 输出含超长记录，无法排除逐条错误；请核对目标频道，不自动重发。')
-        return True, out or 'TDL 已结束，未报告逐条错误。'
+        return False, UnconfirmedReceipt('TDL 命令已结束，但没有可核验的逐条投递回执；请核对目标频道，不自动重发。')
 
 
 # ─────────────────────────── TelegramBot ───────────────────────
@@ -1699,7 +1751,11 @@ class TelegramBot:
         link = match.group(0)
         if TDLDownloader.parse_message_link(link)[1] is None:
             return None
-        return None if any(kw in link.lower() for kw in EXCLUDE_KEYWORDS) else link
+        if any(kw in link.lower() for kw in EXCLUDE_KEYWORDS):
+            return None
+        if query and any(k.lower() == 'single' for k, _ in parse_qsl(query[1], keep_blank_values=True)):
+            return link + '?single'
+        return link
 
     async def resolve_link(self, event) -> Optional[str]:
         message = event.message
@@ -1944,10 +2000,11 @@ class TelegramBot:
 
     @staticmethod
     async def edit_monitor_message(client, target_peer, target_msg_id, current, before_send=None, *, verify=False,
-                                   cloned=False, replacement=None) -> None:
+                                   cloned=False, replacement=None, target=None) -> None:
         file = replacement if cloned else monitor_visual_media(current.media)
         if file is not None or verify:
-            target = await client.get_messages(target_peer, ids=target_msg_id)
+            if target is None:
+                target = await client.get_messages(target_peer, ids=target_msg_id)
             if target is None or isinstance(target, types.MessageEmpty):
                 raise ValueError(f"目标消息 {target_msg_id} 已删除或不可读取，不能原地编辑")
             previous = monitor_visual_media(target.media)
@@ -2032,7 +2089,8 @@ class TelegramBot:
                     async with self._monitor_db_lock:
                         mappings = self.monitor_message_map()
                         mappings.remember(source_id, target_id, pairs,
-                            'bot' if client is self.client else 'user', {p.id: media_key(p) for p in posts})
+                            'bot' if client is self.client else 'user', {p.id: media_key(p) for p in posts},
+                            {mid: uploaded_media_key(media[mid]) for mid in pairs}, album_member=task.grouped_id is not None)
                         unknown = [mid for mid in ids if mappings.copy_state(source_id, mid, target_id)
                                    != TaskStatus.COMPLETED]
                     self.task_queue.record_copy_result(task, unknown)
@@ -2042,18 +2100,19 @@ class TelegramBot:
                     raise CopyOutcomeUnknown(f'TDL 回退上传结果须核对，不自动重发：{exc}') from exc
                 await self.task_queue.reconcile_early_edits(task, pairs)
                 if unknown:
-                    raise CopyOutcomeUnknown(f'回退回执不完整，以下源成员待核对：{unknown}')
+                    raise CopyOutcomeUnknown.missing_confirmations('TDL 回退上传', unknown, pairs)
         finally:
             if not publishing:
                 # Downloads and uploadMedia do not publish any channel posts.
                 async with self._monitor_db_lock:
                     self.monitor_message_map().release_rejected(source_id, target_id, reserved)
         task.status = TaskStatus.COMPLETED
-        self.forward_log.add(task.link, target_id, True)
-        links = '\n'.join(f'https://t.me/c/{target_id}/{pairs[mid]}' for mid in ids)
+        self.forward_log.add(task.link, target_id, True, target_message_id=pairs.get(ids[0]))
+        links = '\n'.join(target_post_ref(target_id, pairs[mid], album_member=task.grouped_id is not None) for mid in ids)
         await self.report_monitor_status(f'✅ TDL 回退上传成功，已建立 {len(pairs)} 条编辑映射。\n{links}')
 
-    async def _edit_mapped_post(self, task, client, source_peer, target_peer, mapped, cloned_key):
+    async def _edit_mapped_post(self, task, client, source_peer, target_peer, mapped, cloned_keys):
+        cloned_key, target_key = cloned_keys
         source_msg_id = task.message_ids[0]
         source_id = task.source_chat_id
         current = await client.get_messages(source_peer, ids=source_msg_id)
@@ -2067,37 +2126,62 @@ class TelegramBot:
             if key == 'text' and cloned_key != 'text':
                 # Omitting media on EditMessage changes the caption, not the attachment.
                 raise ValueError('源帖附件已移除；不支持将带媒体的目标帖原地改为纯文字，未修改目标帖')
+            target = None
+            replace_media = key != cloned_key and key != 'text'
+            if task.verify_edit:
+                target = await client.get_messages(target_peer, ids=mapped)
+                if target is None or isinstance(target, types.MessageEmpty):
+                    raise ValueError(f'无法读取目标消息 {mapped}，不能核验编辑')
+                actual = media_key(target)
+                if key == 'text':
+                    if actual != 'text':
+                        raise ValueError('目标帖仍有附件，不能仅凭文字确认编辑')
+                    target_key = 'text'
+                else:
+                    # A lost edit may have changed the target even if the source reverted (A -> B -> A).
+                    expected = target_key if key == cloned_key else None
+                    if task.edit_media_intent and task.edit_media_intent[0] == key:
+                        expected = task.edit_media_intent[1]
+                    if expected is None:
+                        raise ValueError('没有与当前源媒体对应的目标媒体指纹，无法核验编辑')
+                    target_key = expected
+                    replace_media = actual != expected
             with tempfile.TemporaryDirectory(prefix='monitor-edit-') as directory:
                 replacement = None
-                if key != cloned_key and key != 'text':
+                if replace_media:
                     media = await upload_batch(self.tdl, client, source_peer, target_peer, source_id, [current], directory)
                     replacement = media[source_msg_id]
+                    target_key = uploaded_media_key(replacement)
                     latest = await client.get_messages(source_peer, ids=source_msg_id)
                     if latest is None or isinstance(latest, types.MessageEmpty):
                         raise ValueError('下载期间源帖已删除，未编辑目标消息')
                     if media_key(latest) != key:
                         raise errors.FileReferenceExpiredError(None)
                     current = latest
+                # begin_send journals these keys before the edit RPC, never the file reference/access hash.
+                task.edit_media_intent = [key, target_key] if target_key is not None else None
                 await self.edit_monitor_message(client, target_peer, mapped, current,
                     partial(self.task_queue.begin_send, task), verify=task.verify_edit,
-                    cloned=True, replacement=replacement)
-            async with self._monitor_db_lock:
-                self.monitor_message_map().update_cloned_media_key(*task.edit_key, key)
+                    cloned=True, replacement=replacement, target=target)
+            if (key, target_key) != cloned_keys:
+                task.verify_edit = True  # A DB failure after the RPC must not discard its journaled intent.
+                async with self._monitor_db_lock:
+                    self.monitor_message_map().update_cloned_media_keys(*task.edit_key, key, target_key)
 
     async def process_monitor_task(self, task: ForwardTask) -> None:
         source_id, target_id = task.source_chat_id, task.target_chat_id
         message_ids = task.message_ids
-        mapped = None
+        mapped, album_member = None, False
         try:
             if task.mode == "monitor_edit":
                 source_msg_id = message_ids[0]
                 async with self._monitor_db_lock:
                     m = self.monitor_message_map()
-                    mapped = m.get(*task.edit_key)
+                    mapped, album_member = m.mapped_post(*task.edit_key)
                     sender_role = m.sender_role(*task.edit_key) if mapped is not None else None
-                    cloned_key = m.cloned_media_key(*task.edit_key) if mapped is not None else None
+                    cloned_keys = m.cloned_media_keys(*task.edit_key) if mapped is not None else (None, None)
                     if mapped is None and task.verify_edit:
-                        raise ValueError('原编辑回执未确认，当前目标映射不可用')
+                        raise ValueError('无法确认上次编辑是否生效，也找不到对应的目标帖')
                     if mapped is None and m.can_await_mapping(*task.edit_key):
                         self.task_queue.note_early_edit(task)
                 if mapped is None:
@@ -2107,7 +2191,7 @@ class TelegramBot:
                 # 出队后取源帖最新版本，避免较旧的编辑事件覆盖新的正文或媒体。
                 client, source_peer, target_peer = await self.monitor_route(task, sender_role)
                 try:
-                    await self._edit_mapped_post(task, client, source_peer, target_peer, mapped, cloned_key)
+                    await self._edit_mapped_post(task, client, source_peer, target_peer, mapped, cloned_keys)
                 except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError,
                         errors.MessageAuthorRequiredError):
                     if not task.send_started or task.refused_role is not None or not self.is_user_monitor_active():
@@ -2116,7 +2200,7 @@ class TelegramBot:
                     task.send_started = False
                     self.task_queue.journal.save(task)
                     client, source_peer, target_peer = await self.monitor_route(task, sender_role)
-                    await self._edit_mapped_post(task, client, source_peer, target_peer, mapped, cloned_key)
+                    await self._edit_mapped_post(task, client, source_peer, target_peer, mapped, cloned_keys)
                 logger.info("已同步频道编辑：%s -> %s/%s", task.link, target_id, mapped)
             else:
                 rejected = task.rejected_copy
@@ -2156,11 +2240,13 @@ class TelegramBot:
                         return
                     async with self._monitor_db_lock:
                         mappings = self.monitor_message_map()
-                        self.task_queue.begin_send(task)
+                        # Journal first for crash recovery; a rolled-back reservation has not sent any RPC.
+                        self.task_queue.journal.save(task, 'sending')
                         reserved = mappings.reserve(source_id, target_id, message_ids, whole_album=whole_album)
                         if not reserved:
                             task.status = mappings.batch_copy_state(source_id, target_id, message_ids, whole_album=whole_album)
                             return
+                    task.send_started = True
                     request = functions.messages.ForwardMessagesRequest(
                         from_peer=source_peer, id=list(reserved), random_id=list(reserved.values()),
                         to_peer=target_peer, drop_author=True,
@@ -2210,11 +2296,12 @@ class TelegramBot:
                 try:
                     pairs = receipt_pairs(sent, reserved, allow_short=False)
                 except ValueError as exc:
-                    raise CopyOutcomeUnknown(f'原生复制回执无效，未建立编辑映射：{exc}') from exc
+                    raise CopyOutcomeUnknown(f'无法确认目标消息 ID，未建立编辑映射：{exc}') from exc
                 try:
                     async with self._monitor_db_lock:
                         mappings = self.monitor_message_map()
-                        mappings.remember(source_id, target_id, pairs, 'bot' if client is self.client else 'user')
+                        mappings.remember(source_id, target_id, pairs, 'bot' if client is self.client else 'user',
+                                          album_member=whole_album)
                         unknown = [mid for mid in message_ids
                                    if mappings.copy_state(source_id, mid, target_id) != TaskStatus.COMPLETED]
                 except sqlite3.Error as exc:
@@ -2222,13 +2309,14 @@ class TelegramBot:
                 try:
                     self.task_queue.record_copy_result(task, unknown)
                 except sqlite3.Error as exc:
-                    raise CopyOutcomeUnknown('回执已保存，但队列状态未能更新；将按逐条映射核对') from exc
+                    raise CopyOutcomeUnknown('队列状态未能更新，将按已保存的消息映射逐条核对') from exc
                 await self.task_queue.reconcile_early_edits(task, pairs)
                 if unknown:
-                    raise CopyOutcomeUnknown(f"回执不完整；以下源消息待核对，不重发：{unknown}")
-                self.forward_log.add(task.link, target_id, True)
+                    raise CopyOutcomeUnknown.missing_confirmations('原生复制', unknown, pairs)
+                self.forward_log.add(task.link, target_id, True, target_message_id=pairs.get(message_ids[0]))
                 logger.info("已复制频道帖子并记录映射：%s -> %s, ids=%s", task.link, target_id, pairs)
-                await self.report_monitor_status(f"✅ 自动复制成功：{task.link} → {target_id}")
+                target_links = '\n'.join(target_post_ref(target_id, dest_id, album_member=whole_album) for dest_id in pairs.values())
+                await self.report_monitor_status(f"✅ 自动复制成功：{task.link} → {target_links}")
             task.status = TaskStatus.COMPLETED
         except MonitorPeerMissing as exc:
             # No send RPC was made. Preserve admission and its original target through a cold cache.
@@ -2238,14 +2326,31 @@ class TelegramBot:
                 task.status = TaskStatus.PENDING
                 self.task_queue.journal.save(task, 'wait_peer')
                 self.task_queue._peer_wait[task.job_id] = task
-                await self.report_monitor_status(f'⏳ 频道实体尚未就绪，任务已保留：{task.link} → {target_id}\n{exc}', failed=True)
+                await self.report_monitor_status(f'⏳ 频道实体尚未就绪，任务已保留：{task.link} → {target_post_ref(target_id, mapped, album_member=album_member)}\n{exc}', failed=True)
         except CopyOutcomeUnknown as exc:
             task.status = TaskStatus.UNCONFIRMED
             task.error_msg = str(exc)
             logger.error("自动复制待核对：%s -> %s: %s", task.link, target_id, exc)
-            self.forward_log.add(task.link, target_id, False, str(exc))
-            await self.report_monitor_status(f"⚠️ 自动复制结果待核对：{task.link} → {target_id}\n{exc}", failed=True)
+            self.forward_log.add(task.link, target_id, False, UnconfirmedReceipt(str(exc)))
+            notice = f"⚠️ 自动复制结果待核对：{task.link} → {target_id}\n{exc}"
+            if exc.confirmed_pairs:
+                confirmed = (f'源消息 {mid} → {target_post_ref(target_id, dest, album_member=task.grouped_id is not None)}'
+                             for mid, dest in exc.confirmed_pairs.items())
+                notice += '\n已确认的成员：\n' + '\n'.join(confirmed)
+            await self.report_monitor_status(notice, failed=True)
         except Exception as exc:
+            if not task.send_started and sqlite_is_busy(exc):
+                if task.store_retries < 2:
+                    self.task_queue.retry_later(task, 2 ** (task.store_retries + 1), store=True)
+                    logger.warning('映射库忙，发送前退避重试：%s', task.link)
+                else:
+                    task.ready_at = 0
+                    self.task_queue.journal.save(task, 'wait_store')
+                    task.status = TaskStatus.PENDING
+                    self.task_queue._store_wait[task.job_id] = task
+                    await self.report_monitor_status(f'⏳ 映射库仍被锁定，本次未发送：{task.link} → {target_id}。'
+                        '任务已保留，解锁后重启可恢复。', failed=True)
+                return
             # 编辑重试重新读取映射、最新正文和媒体引用，不执行复制请求。
             if task.mode == "monitor_edit" and task.retries < 2:
                 delay = None
@@ -2273,19 +2378,19 @@ class TelegramBot:
             uncertain_edit = task.mode == 'monitor_edit' and (task.verify_edit or (task.send_started and ambiguous_rpc))
             uncertain_copy = False
             if task.mode == 'monitor_copy' and task.send_started and isinstance(exc, (sqlite3.Error, OSError)):
-                # If reserve() rolled back before dispatch, there is nothing to review. An intent
-                # left behind by a failed release must remain discoverable even after restart.
-                uncertain_copy = any(self.monitor_message_map().copy_state(source_id, mid, target_id)
-                                     == TaskStatus.UNCONFIRMED for mid in message_ids)
+                # A failed release can leave an unresolved intent. If the DB is locked, fail closed.
+                uncertain_copy = sqlite_is_busy(exc) or any(
+                    self.monitor_message_map().copy_state(source_id, mid, target_id) == TaskStatus.UNCONFIRMED
+                    for mid in message_ids)
             task.status = TaskStatus.UNCONFIRMED if uncertain_edit or uncertain_copy else TaskStatus.FAILED
             if task.status == TaskStatus.UNCONFIRMED:
-                task.error_msg = f'结果待核对，不自动重发：{exc}'
+                task.error_msg = UnconfirmedReceipt(f'结果待核对，不自动重发：{exc}')
             logger.error("频道同步失败（%s）：%s -> %s: %s", task.mode, task.link, target_id, exc, exc_info=True)
             if task.mode == "monitor_copy":
                 self.forward_log.add(task.link, target_id, False, task.error_msg)
                 await self.report_monitor_status(f"⚠️ 自动复制：{task.link} → {target_id}\n{task.error_msg}", failed=True)
             else:
-                await self.report_monitor_status(f"⚠️ 频道编辑：{task.link} → {target_id}\n{task.error_msg}", failed=True)
+                await self.report_monitor_status(f"⚠️ 频道编辑：{task.link} → {target_post_ref(target_id, mapped, album_member=album_member)}\n{task.error_msg}", failed=True)
 
     async def start_user_monitor(self) -> None:
         if not USER_MONITOR_ENABLED:
@@ -2527,9 +2632,9 @@ class TelegramBot:
                 return True
             async with self._monitor_db_lock:
                 if self._stopping:
-                    mapped = None
+                    mapped, album_member = None, False
                 else:
-                    mapped = self.monitor_message_map().get(source_id, mid, target_id)
+                    mapped, album_member = self.monitor_message_map().mapped_post(source_id, mid, target_id)
             if self._stopping:
                 await respond("⏹️ 服务正在停止，未加入同步队列")
             elif mapped is None:
@@ -2538,9 +2643,9 @@ class TelegramBot:
                 await respond(self.task_queue.admission_error('未加入同步队列', admission_epoch=epoch))
             else:
                 await respond(
-                    f"⏳ 已加入原地同步队列：{source_id}/{mid}\n"
-                    f"🔗 查看目标帖： https://t.me/c/{target_id}/{mapped}\n"
-                    "此回执表示已受理，不代表同步完成。",
+                    "⏳ 任务已入队，尚未完成同步。\n"
+                    f"源帖：{source_id}/{mid}\n"
+                    f"🔗 查看目标帖： {target_post_ref(target_id, mapped, album_member=album_member)}",
                     link_preview=False, **({"receipt_kind": "sync"} if panel_feedback else {}),
                 )
             return True
@@ -2675,6 +2780,8 @@ class TelegramBot:
                 f"运行状态：{'运行中' if status['running'] else '已停止'}\n",
                 f"等待中：{queue_size}\n",
             ]
+            if status["waiting_for_store"]:
+                lines.append(f"其中 {status['waiting_for_store']} 项等待映射库解锁，解锁后重启可恢复。\n")
             if current_task:
                 lines.extend([
                     "\n正在处理：\n",
@@ -2687,7 +2794,17 @@ class TelegramBot:
                     lines.append('没有更早的记录。\n')
                 for item in recent[:5]:
                     detail = f" {item['message_ids']}" if item['mode'] in ('export_range', 'monitor_copy') else ''
-                    lines.append(f"#{item['job_id']} {item['mode']}：{item['link']}{detail} → {item['target_chat_id']}\n")
+                    target = item['target_chat_id']
+                    mapped, album_member = None, False
+                    if item['mode'] == 'monitor_edit' and item['message_ids']:
+                        try:
+                            async with self._monitor_db_lock:
+                                if not self._stopping:
+                                    mapped, album_member = self.monitor_message_map().mapped_post(
+                                        item['source_chat_id'], item['message_ids'][0], target)
+                        except (sqlite3.Error, OSError):
+                            logger.warning('无法读取待核对编辑的目标映射：任务 #%s', item['job_id'], exc_info=True)
+                    lines.append(f"#{item['job_id']} {item['mode']}：{item['link']}{detail} → {target_post_ref(target, mapped, album_member=album_member)}\n")
                 if len(recent) > 5:
                     lines.append(f"下一页：/queue {recent[4]['job_id']}")
             await respond("".join(lines))

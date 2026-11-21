@@ -116,7 +116,7 @@ class AdditionalAuditTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
             task = await self.process()
         self.assertEqual(task.status, app.TaskStatus.FAILED)
         self.assertIn('源帖附件已移除', task.error_msg)
-        self.assertEqual(m.cloned_media_key(SOURCE, 11, TARGET), old_key)
+        self.assertEqual(m.cloned_media_keys(SOURCE, 11, TARGET)[0], old_key)
         client.edit_message.assert_not_awaited()
         client.forward.assert_not_awaited()
 

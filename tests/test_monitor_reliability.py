@@ -119,10 +119,22 @@ class MonitorReliabilityTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
         def read(peer, ids): return NS(raw_text='old' if ids == 88 else 'latest', entities=[], media=None)
         self.bot.client.get_messages.side_effect = read
         self.bot.client.edit_message.side_effect = ConnectionError('lost receipt')
+        self.bot.report_monitor_status = AsyncMock()
         await self.enqueue(self.event(17), edited=True); await self.process(); await self.retry_now()
         with self.assertLogs(app.logger, 'ERROR'):
             self.assertEqual((await self.retry_now()).status, app.TaskStatus.UNCONFIRMED)
+        self.assertIn(f'→ https://t.me/c/{TARGET}/88', self.bot.report_monitor_status.await_args.args[0])
         q = await self.reopen()
+        respond = AsyncMock()
+        with patch.object(app, 'ADMIN_IDS', [61]):
+            self.bot.target_chat_id = TARGET + 1  # Review uses the job's original route.
+            await self.bot.run_admin_action(NS(sender_id=61), ['/queue'], respond)
+            self.assertIn(f'→ https://t.me/c/{TARGET}/88', respond.await_args.args[0])
+            mappings = self.bot.monitor_message_map()
+            with mappings.db:
+                mappings.db.execute('DELETE FROM monitor_messages')
+            await self.bot.run_admin_action(NS(sender_id=61), ['/queue'], respond)
+            self.assertIn(f'→ {TARGET}\n', respond.await_args.args[0])
         self.assertEqual(q.journal.reviews()[0], 1)
         self.assertTrue(q.queue.empty()); self.assertFalse(q._retry_timers)
         self.bot.client.forward.assert_not_awaited()
@@ -151,6 +163,16 @@ class MonitorReliabilityTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
         await self.enqueue(self.event(31)); await self.process(); await self.process()
         self.assertEqual([c.args[0].id for c in self.bot.client.forward.await_args_list], [[30], [31]])
         self.assertFalse(q._peer_wait)
+
+    async def test_waiting_edit_receipt_links_to_known_destination(self):
+        self.bot.monitor_message_map().remember(SOURCE, TARGET, {17: 88})
+        await self.enqueue(self.event(17), edited=True)
+        await self.reopen()
+        self.bot.report_monitor_status = AsyncMock()
+        self.bot.client.get_input_entity.side_effect = ValueError('cold cache')
+        await self.process(); await self.retry_now(); await self.retry_now()
+        self.assertIn(f'→ https://t.me/c/{TARGET}/88', self.bot.report_monitor_status.await_args.args[0])
+        self.bot.client.edit_message.assert_not_awaited()
 
     async def test_explicit_private_denial_is_not_cache_miss(self):
         await self.enqueue(self.event(30)); q = await self.reopen()
@@ -192,6 +214,61 @@ class MonitorReliabilityTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
             await attempted.wait(); await q.stop_tdl_tasks(); await pending
             self.assertEqual(save.call_count, 1)
         self.assertTrue(q.queue.empty()); self.assertIsNone(self.bot._admission_alert)
+
+    async def test_single_copy_receipt_links_to_target_message(self):
+        self.bot.report_monitor_status = AsyncMock()
+        await self.enqueue(self.event(10))
+        await self.process()
+        self.bot.report_monitor_status.assert_awaited_once_with(
+            f'✅ 自动复制成功：https://t.me/c/{SOURCE}/10 → https://t.me/c/{TARGET}/730')
+
+    async def test_album_copy_receipt_lists_target_messages_in_source_order(self):
+        self.bot.report_monitor_status = AsyncMock()
+        album = self.event(8, 12, album=44)
+        self.bot.client.get_messages.return_value = album.messages
+        await self.enqueue(album)
+        await self.process()
+        self.bot.report_monitor_status.assert_awaited_once_with(
+            f'✅ 自动复制成功：https://t.me/c/{SOURCE}/8 → https://t.me/c/{TARGET}/724?single\n'
+            f'https://t.me/c/{TARGET}/736?single')
+        self.bot.forward_log.add.assert_called_once_with(f'https://t.me/c/{SOURCE}/8', TARGET, True,
+                                                         target_message_id=724)
+
+    async def test_resync_links_to_the_mapped_album_member_after_restart(self):
+        album = self.event(8, 12, album=44)
+        self.bot.client.get_messages.return_value = album.messages
+        await self.enqueue(album); await self.process()
+        await self.reopen()
+        respond = AsyncMock()
+        with patch.object(app, 'ADMIN_IDS', [61]):
+            await self.bot.run_admin_action(NS(sender_id=61, chat_id=61), ['/resync', str(SOURCE), '12'], respond)
+        self.assertIn(f'https://t.me/c/{TARGET}/736?single', respond.await_args.args[0].split())
+        self.bot.client.forward.assert_not_awaited()
+
+    async def test_partial_album_receipt_separates_confirmed_and_unresolved(self):
+        self.bot.report_monitor_status = AsyncMock()
+        album = self.event(8, 12, album=44)
+        self.bot.client.get_messages.return_value = album.messages
+        self.bot.client.forward.side_effect = lambda req: NS(updates=[
+            app.types.UpdateMessageID(736, req.random_id[1])])
+        await self.enqueue(album)
+        with self.assertLogs(app.logger, 'ERROR'):
+            self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)
+        notice = self.bot.report_monitor_status.await_args.args[0]
+        self.assertIn('原生复制：部分消息已确认，其余待核对。不会自动重发。\n待核对的源消息 ID：[8]', notice)
+        self.assertEqual(notice.split('已确认的成员：\n')[1], f'源消息 12 → https://t.me/c/{TARGET}/736?single')
+        self.assertEqual(self.bot.task_queue.journal.reviews()[1][0]['message_ids'], [8])
+
+    async def test_no_confirmations_notice_does_not_claim_partial_delivery(self):
+        self.bot.report_monitor_status = AsyncMock()
+        self.bot.client.forward.side_effect = lambda request: NS(updates=[])
+        await self.enqueue(self.event(8))
+        with self.assertLogs(app.logger, 'ERROR'):
+            self.assertEqual((await self.process()).status, app.TaskStatus.UNCONFIRMED)
+        notice = self.bot.report_monitor_status.await_args.args[0]
+        self.assertIn('尚未确认消息是否送达。不会自动重发。\n待核对的源消息 ID：[8]', notice)
+        self.assertNotIn('部分消息已确认', notice)
+        self.assertNotIn('已确认的成员', notice)
 
     async def test_confirmed_copy_committed_before_status_notification(self):
         entered = asyncio.Event()

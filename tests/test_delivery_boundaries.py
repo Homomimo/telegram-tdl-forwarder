@@ -123,7 +123,7 @@ class DeliveryBoundaryTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
     async def test_rolled_back_reservation_is_not_an_uncertain_delivery(self):
         m = self.bot.monitor_message_map()
         await self.enqueue(self.event(8))
-        with patch.object(m, 'reserve', side_effect=sqlite3.OperationalError('locked')), self.assertLogs(app.logger, 'ERROR'):
+        with patch.object(m, 'reserve', side_effect=sqlite3.OperationalError('disk I/O error')), self.assertLogs(app.logger, 'ERROR'):
             self.assertEqual((await self.process()).status, app.TaskStatus.FAILED)
         self.assertEqual(self.bot.task_queue.journal.restore(), [])
         self.bot.client.forward.assert_not_awaited()
@@ -171,6 +171,45 @@ class DeliveryBoundaryTests(MonitorHarness, unittest.IsolatedAsyncioTestCase):
 
 
 class LocalStorageAndSessionTests(unittest.TestCase):
+    def test_history_links_only_to_a_recorded_target_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'history.json'
+            history = app.ForwardLog(path)
+            source_link = f'https://t.me/c/{SOURCE}/10'
+            history.add(source_link, TARGET, True, target_message_id=730)
+            history.add(source_link, TARGET, True)  # Manual delivery or legacy row, even for the same source.
+            rows = app.ForwardLog(path).get_all()
+            text = app.format_recent_history(rows, len(rows))
+            self.assertEqual([line for line in text.splitlines() if line.startswith('TO:')],
+                             [f'TO:   {TARGET}', f'TO:   https://t.me/c/{TARGET}/730'])
+
+    def test_older_mapping_keeps_its_target_and_unknown_media_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'map.sqlite3')
+            with contextlib.closing(sqlite3.connect(path)) as old, old:
+                old.execute('CREATE TABLE monitor_messages (source_chat_id INTEGER, source_message_id INTEGER, '
+                            'target_chat_id INTEGER, target_message_id INTEGER, confirmed_at INTEGER, '
+                            'sender_role TEXT, cloned_media_key TEXT, PRIMARY KEY(source_chat_id,source_message_id,target_chat_id))')
+                old.execute('INSERT INTO monitor_messages VALUES (?,?,?,?,?,?,?)',
+                            (SOURCE, 7, TARGET, 91, 123, 'bot', 'photo:5:False'))
+            with contextlib.closing(app.MonitorMessageMap(path)) as upgraded:
+                self.assertEqual(upgraded.mapped_post(SOURCE, 7, TARGET), (91, False))
+                self.assertEqual(upgraded.cloned_media_keys(SOURCE, 7, TARGET), ('photo:5:False', None))
+                self.assertEqual(upgraded.copy_state(SOURCE, 7, TARGET), app.TaskStatus.COMPLETED)
+
+    def test_unconfirmed_history_survives_json_and_is_not_failure_or_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'history.json'
+            history = app.ForwardLog(path)
+            history.add('manual', TARGET, False, app.UnconfirmedReceipt('no delivery receipts'))
+            rows = app.ForwardLog(path).get_all()
+            self.assertFalse(rows[0]['success'])
+            message = app.format_recent_history(rows, 1)
+            self.assertIn('⚠️ #', message)
+            self.assertIn('待核对: no delivery receipts', message)
+            self.assertNotIn('✅', message)
+            self.assertNotIn('❌', message)
+
     def test_idle_flush_retries_removal_of_expired_rows_after_read(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'history.json'

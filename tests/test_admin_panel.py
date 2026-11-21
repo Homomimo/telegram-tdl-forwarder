@@ -160,7 +160,7 @@ class PrivatePanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.messages[prompt].buttons, types.ReplyKeyboardForceReply)
         await self.text(link)
         self.bot.do_forward.assert_awaited_once()
-        self.assert_input_receipt(await self.reply(link), '已加入原地同步队列')
+        self.assert_input_receipt(await self.reply(link), '任务已入队，尚未完成同步。')
         self.assertIn(f'https://t.me/c/{TARGET}/91', self.page.raw_text.split())
         q = self.bot.task_queue.queue
         self.assertEqual(q.qsize(), 1)
@@ -192,7 +192,7 @@ class PrivatePanelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sync_receipt_uses_queue_admission_result(self):
         self.bot.monitor_message_map().remember(SOURCE, TARGET, {7: 91})
-        for position, expected in [(None, '未加入同步队列'), (0, '已加入原地同步队列')]:
+        for position, expected in [(None, '未加入同步队列'), (0, '任务已入队，尚未完成同步。')]:
             with self.subTest(position=position), patch.object(self.bot.task_queue, 'enqueue_edit',
                                                                 new=AsyncMock(return_value=position)) as enqueue:
                 await self.text('/start'); await self.click('🔄 手动同步')
@@ -208,7 +208,7 @@ class PrivatePanelTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs('admin_panel', 'ERROR'):
             ev = await self.text(link, reply=prompt)
         ev.respond.assert_awaited_once()
-        self.assertIn('已加入原地同步队列', ev.respond.await_args.args[0])
+        self.assertIn('任务已入队，尚未完成同步。', ev.respond.await_args.args[0])
         self.assertEqual(ev.respond.await_args.kwargs['reply_to'], ev.message.id)
         self.assertNotIn(UID, self.bot.admin_panel.sessions)
         with patch.object(self.bot.task_queue, 'enqueue_edit', new_callable=AsyncMock) as enqueue:
@@ -224,7 +224,7 @@ class PrivatePanelTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self, 'send', side_effect=ConnectionError('receipt failed')), self.assertLogs('admin_panel', 'WARNING'):
             ev = await self.reply(f'https://t.me/c/{SOURCE}/7')
         ev.respond.assert_awaited_once()
-        self.assertIn('已加入原地同步队列', self.page.raw_text)
+        self.assertIn('任务已入队，尚未完成同步。', self.page.raw_text)
         self.assertEqual(self.bot.task_queue.queue.qsize(), 1)
         self.assertFalse(self.session.prompt_id)
 

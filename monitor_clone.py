@@ -17,6 +17,17 @@ def media_key(post):
     raise ValueError('TDL 回退暂不支持该媒体类型，未降级成文字或拆散相册')
 
 
+def uploaded_media_key(media):
+    # Permanent identity from uploadMedia; access hashes and expiring file references aren't fingerprints.
+    if media is None:
+        return 'text'
+    if isinstance(media, types.InputMediaPhoto):
+        return f'photo:{media.id.id}:{bool(media.spoiler)}'
+    if isinstance(media, types.InputMediaDocument):
+        return f'document:{media.id.id}:{bool(media.spoiler)}'
+    raise ValueError('缺少可核验的目标媒体引用')
+
+
 class AlbumNotReady(ValueError):
     """The source does not yet expose all observed album members."""
 
